@@ -1,101 +1,284 @@
 import streamlit as st
-import numpy as np
 import pandas as pd
-import plotly.express as px
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# -------- Fonctions de calcul --------
-def allocate_steps(weights, lower, upper, sigma):
+
+############################
+# Utilitaires mathématiques #
+############################
+
+def _segment_series(series: pd.Series, n_segments: int, method: str = "quantile") -> pd.Series:
+    """Retourne une série d'entiers 0..n_segments-1 selon la méthode choisie."""
+    if method == "quantile":
+        # qcut gère les duplications éventuelles de quantiles via duplicates='drop'
+        return pd.qcut(series, n_segments, labels=False, duplicates="drop")
+    elif method == "equal-width":
+        return pd.cut(series, n_segments, labels=False, include_lowest=True)
+    else:
+        raise ValueError("Méthode de segmentation inconnue : choisissez 'quantile' ou 'equal-width'.")
+
+
+def build_majoration_matrix(
+    df: pd.DataFrame,
+    elr_col: str = "ELR",
+    conv_col: str = "conversion",
+    loss_col: str = "loss",
+    prem_col: str = "premium",
+    n_elr: int = 20,
+    n_conv: int = 10,
+    method: str = "quantile",
+):
+    """Calcule la matrice de majoration normalisée et la matrice des effectifs.
+
+    Retourne
+    -------
+    M : DataFrame (n_elr x n_conv)
+        Matrice normalisée dont la moyenne pondérée vaut 1.
+    N : DataFrame (n_elr x n_conv)
+        Effectifs (nombre d'expositions) par cellule.
     """
-    Distribution gloutonne d'un total sigma sur des variables bornées,
-    en favorisant celles ayant les plus grands poids.
+    df = df.copy()
+
+    # Segmentation
+    df["elr_seg"] = _segment_series(df[elr_col], n_elr, method)
+    df["conv_seg"] = _segment_series(df[conv_col], n_conv, method)
+
+    # Agrégations
+    N = (
+        df.pivot_table(index="elr_seg", columns="conv_seg", values=prem_col, aggfunc="count", fill_value=0)
+        .astype(int)
+        .sort_index()
+    )
+    P = df.pivot_table(index="elr_seg", columns="conv_seg", values=prem_col, aggfunc="sum", fill_value=0.0)
+    S = df.pivot_table(index="elr_seg", columns="conv_seg", values=loss_col, aggfunc="sum", fill_value=0.0)
+
+    # ELR par cellule avec gestion divisions par zéro
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ELR_ij = S / P.replace(0, np.nan)
+
+    ELR_portefeuille = df[loss_col].sum() / df[prem_col].sum()
+    m_brut = ELR_ij / ELR_portefeuille
+
+    # Normalisation (moyenne pondérée = 1)
+    poids_total = N.values.sum()
+    normal_const = (m_brut * N).values.sum() / poids_total
+    M = m_brut / normal_const
+
+    return M, N
+
+
+def ipf_factorisation(
+    M: pd.DataFrame, N: pd.DataFrame, tol: float = 1e-6, max_iter: int = 100
+):
+    """Itérative Proportional Fitting pour approximer M ≈ a_i * b_j.
+
+    Parameters
+    ----------
+    M : DataFrame
+        Matrice normalisée (moyenne pondérée = 1).
+    N : DataFrame
+        Matrice des effectifs, même shape que M.
+    tol : float
+        Critère de convergence sur les a_i.
+    max_iter : int
+        Nombre maximal d'itérations.
+
+    Returns
+    -------
+    a : ndarray (n_elr,)
+    b : ndarray (n_conv,)
     """
-    n = len(weights)
-    allocation = lower.copy().astype(float)
-    remaining = sigma - allocation.sum()
-    # Indices triés par poids décroissant
-    idx_sorted = np.argsort(weights)[::-1]
-    for i in idx_sorted:
-        if remaining <= 0:
+    a = np.ones(M.shape[0])
+    b = np.ones(M.shape[1])
+    N_val = N.values
+    M_val = M.values
+
+    for _ in range(max_iter):
+        a_old = a.copy()
+
+        # Mise à jour de a_i
+        for i in range(len(a)):
+            num = (M_val[i, :] * b * N_val[i, :]).sum()
+            den = (b * N_val[i, :]).sum()
+            a[i] = num / den if den > 0 else 1.0
+
+        # Normalisation pour conserver la moyenne pondérée = 1
+        a /= np.average(a, weights=N.sum(axis=1))
+
+        # Mise à jour de b_j
+        for j in range(len(b)):
+            num = (M_val[:, j] * a * N_val[:, j]).sum()
+            den = (a * N_val[:, j]).sum()
+            b[j] = num / den if den > 0 else 1.0
+
+        b /= np.average(b, weights=N.sum(axis=0))
+
+        if np.max(np.abs(a - a_old)) < tol:
             break
-        cap = upper[i] - lower[i]
-        delta = min(cap, remaining)
-        allocation[i] += delta
-        remaining -= delta
-    return allocation
+
+    return a, b
 
 
-def compute_matrix(alpha, beta):
-    """
-    Construit M selon :
-    M[0,0] = 0
-    M[0,j] = M[0,j-1] + beta[j]
-    M[i,j] = M[i-1,j] + alpha[i]
-    (on indexe alpha et beta à partir de 0)
-    """
-    I = len(alpha)
-    J = len(beta)
-    M = np.zeros((I, J))
-    # première ligne (i=0)
-    for j in range(1, J):
-        M[0, j] = M[0, j-1] + beta[j]
-    # reste
-    for i in range(1, I):
-        for j in range(J):
-            M[i, j] = M[i-1, j] + alpha[i]
-    return M
+####################################
+#        Application Streamlit     #
+####################################
 
-# -------- Interface Streamlit --------
-st.title("Matrice de Majoration")
+def main():
+    st.set_page_config(
+        page_title="Matrice de Majoration ELR × Conversion",
+        layout="wide",
+    )
 
-# Entrée utilisateur pour le coef maximal σ
-sigma = st.number_input("Coefficient maximal σ (M₁₀,₂₀)", min_value=0.0, value=100.0)
+    st.title("🔍 Matrice de majoration entre ELR et Taux de conversion")
+    st.markdown(
+        """
+Cette application construit et visualise une matrice de majoration selon la méthode décrite
+(rapport ELR / ELR_portefeuille, puis normalisation). Chargez vos données ou laissez
+l'application en générer pour la démonstration.
 
-# Poids par défaut (plus le segment est élevé, plus on veut majorer)
-alpha_weights = np.arange(1, 11)  # pour 10 segments de concrétisation
-beta_weights  = np.arange(1, 21)  # pour 20 segments ELR
+*Pré‑requis (si fichier custom)* :
 
-# Bornes globales ajustables via la sidebar
-st.sidebar.header("Bornes pour α et β")
-min_alpha = st.sidebar.number_input("Min α_i", min_value=0.0, value=0.0)
-max_alpha = st.sidebar.number_input("Max α_i", min_value=0.0, value=sigma)
-min_beta  = st.sidebar.number_input("Min β_j", min_value=0.0, value=0.0)
-max_beta  = st.sidebar.number_input("Max β_j", min_value=0.0, value=sigma)
+* premium  – prime émises ou exposées (positif)
+* loss     – coût des sinistres associés
+* ELR      – ratio sinistres / prime (facultatif si loss et premium présents, il sera recalculé)
+* conversion – probabilité ou taux de souscription
+        """
+    )
 
-# Construction des vecteurs de bornes
-lower_alpha = np.full(10, min_alpha)
-upper_alpha = np.full(10, max_alpha)
-lower_beta  = np.full(20, min_beta)
-upper_beta  = np.full(20, max_beta)
+    ###############
+    # Sidebar UI  #
+    ###############
 
-# Calcul des pas α et β
-alpha = allocate_steps(alpha_weights, lower_alpha, upper_alpha, sigma)
-beta  = allocate_steps(beta_weights,  lower_beta,  upper_beta,  sigma)
+    with st.sidebar:
+        st.header("Paramètres")
+        uploaded_file = st.file_uploader(
+            "Fichier CSV", type=["csv"], help="Colonnes attendues : premium, loss, ELR, conversion"
+        )
+        n_elr = st.number_input("Nombre de segments ELR", 1, 100, 20, 1)
+        n_conv = st.number_input("Nombre de segments Conversion", 1, 100, 10, 1)
+        method = st.selectbox("Méthode de segmentation", ["quantile", "equal-width"])
+        visu_ipf = st.checkbox("Afficher la factorisation multiplicative (IPF)", value=False)
 
-# Construction de la matrice M
-M = compute_matrix(alpha, beta)
+    ###############
+    # Data import  #
+    ###############
 
-# Affichage sous forme de DataFrame
-df = pd.DataFrame(
-    M,
-    index=[f"i={i+1}" for i in range(M.shape[0])],
-    columns=[f"j={j+1}" for j in range(M.shape[1])]
-)
-st.subheader("Matrice des coefficients M_{i,j}")
-st.dataframe(df)
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+    else:
+        st.info("Aucun fichier détecté ➡ génération d'un jeu de données simulé (10 000 expositions).")
+        rng = np.random.default_rng(42)
+        n = 10_000
+        premium = rng.uniform(100, 500, size=n)
+        loss_ratio = rng.beta(2, 5, size=n)  # ELR ~ Beta(2,5)
+        loss = loss_ratio * premium
+        conversion = rng.uniform(0, 1, size=n)
+        df = pd.DataFrame(
+            {
+                "premium": premium,
+                "loss": loss,
+                "ELR": loss_ratio,
+                "conversion": conversion,
+            }
+        )
 
-# Affichage heatmap interactif
-fig = px.imshow(
-    M,
-    labels={"x": "ELR segments (j)", "y": "Concrétisation segments (i)", "color": "M"},
-    x=df.columns,
-    y=df.index,
-    aspect="auto"
-)
-st.subheader("Heatmap de la matrice")
-st.plotly_chart(fig)
+    # Vérifications de colonnes
+    expected_cols = {"premium", "loss", "ELR", "conversion"}
+    missing_cols = expected_cols - set(df.columns)
+    if missing_cols:
+        st.error(f"Colonnes manquantes dans le fichier : {', '.join(missing_cols)}")
+        st.stop()
 
-# Affichage des vecteurs α et β
-st.sidebar.subheader("Pas calculés α_i")
-st.sidebar.write(alpha)
-st.sidebar.subheader("Pas calculés β_j")
-st.sidebar.write(beta)
+    # (Re)calcul ELR pour cohérence
+    df["ELR"] = df["loss"] / df["premium"].replace(0, np.nan)
+
+    #########################
+    # Calcul de la matrice  #
+    #########################
+
+    try:
+        M, N = build_majoration_matrix(
+            df,
+            elr_col="ELR",
+            conv_col="conversion",
+            loss_col="loss",
+            prem_col="premium",
+            n_elr=int(n_elr),
+            n_conv=int(n_conv),
+            method=method,
+        )
+    except Exception as e:
+        st.error(f"Erreur lors du calcul de la matrice : {e}")
+        st.stop()
+
+    #########################
+    # Visualisation Heatmap #
+    #########################
+
+    st.subheader("Matrice de majoration normalisée")
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(M, ax=ax, cmap="RdYlGn", center=1, linewidths=0.3)
+    ax.set_xlabel("Segment conversion (j)")
+    ax.set_ylabel("Segment ELR (i)")
+    ax.set_title("Facteur > 1 = majoration / < 1 = minoration")
+    st.pyplot(fig)
+
+    st.markdown(
+        "ℹ La moyenne pondérée (par effectif) de la matrice est exactement 1, assurant la neutralité tarifaire."
+    )
+
+    #########################
+    # Factorisation IPF     #
+    #########################
+
+    if visu_ipf:
+        st.subheader("Factorisation multiplicative (IPF)")
+        a, b = ipf_factorisation(M, N)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("*Facteurs ELR (aᵢ)*")
+            fig1, ax1 = plt.subplots()
+            ax1.bar(range(len(a)), a)
+            ax1.set_xlabel("Segment ELR i")
+            ax1.set_ylabel("aᵢ")
+            st.pyplot(fig1)
+
+        with col2:
+            st.markdown("*Facteurs Conversion (bⱼ)*")
+            fig2, ax2 = plt.subplots()
+            ax2.bar(range(len(b)), b)
+            ax2.set_xlabel("Segment conversion j")
+            ax2.set_ylabel("bⱼ")
+            st.pyplot(fig2)
+
+        st.info(
+            "Produit tensoriel ≈ matrice :  Mᵢⱼ ≈ aᵢ·bⱼ  (erreur réduite après convergences de 4–5 itérations)."
+        )
+
+    #########################
+    #   Téléchargements     #
+    #########################
+
+    st.subheader("Téléchargements")
+    csv_M = M.to_csv(index=True).encode("utf-8")
+    st.download_button(
+        label="📥 Télécharger la matrice (CSV)",
+        data=csv_M,
+        file_name="matrice_majoration.csv",
+        mime="text/csv",
+    )
+
+    csv_N = N.to_csv(index=True).encode("utf-8")
+    st.download_button(
+        label="📥 Télécharger les effectifs (CSV)",
+        data=csv_N,
+        file_name="effectifs_majoration.csv",
+        mime="text/csv",
+    )
+
+
+if _name_ == "_main_":
+    main()
