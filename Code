@@ -1,564 +1,538 @@
+import streamlit as st
+import pandas as pd
 import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import seaborn as sns
 import matplotlib.pyplot as plt
-from typing import List, Tuple, Dict, NamedTuple
-import random
-from enum import Enum
+from scipy.stats import pearsonr
+from io import BytesIO
 
-class SegmentType(Enum):
-    A = "A"  # Haute conversion, Haute rentabilité - Protéger
-    B = "B"  # Haute conversion, Faible rentabilité - Majorer fort
-    C = "C"  # Faible conversion, Haute rentabilité - Modéré
-    D = "D"  # Faible conversion, Faible rentabilité - Décourager
+# Configuration de la page
+st.set_page_config(
+    page_title="Analyse des Atouts PRO",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-class Individual(NamedTuple):
-    """Individu dans la population NSGA-II"""
-    majoration_rates: np.ndarray  # Matrice 10x20 des taux de majoration
-    objectives: Tuple[float, float] = None  # (profit, conversion_rate)
-    rank: int = 0
-    crowding_distance: float = 0.0
+# Titre principal
+st.title("📊 Analyse des Atouts PRO")
+st.markdown("---")
 
-def setup_problem_parameters(n_conv: int = 10, n_profit: int = 20) -> Dict:
-    """Initialise les paramètres du problème d'assurance"""
-    
-    # Taux de conversion par segment (10 segments)
-    C0 = np.array([0.20, 0.35, 0.45, 0.55, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90])
-    
-    # Taux de rentabilité par segment (20 segments)
-    R0 = np.linspace(0.02, 0.20, n_profit)
-    
-    # Volumes par segment (matrice 10x20)
+# Fonctions utilitaires
+@st.cache_data
+def create_sample_data():
+    """Créer des données d'exemple pour démonstration"""
     np.random.seed(42)
-    volumes = np.random.uniform(1000, 10000, (n_conv, n_profit))
     
-    # Élasticité prix (matrice 10x20)
-    elasticity = np.random.uniform(0.5, 2.0, (n_conv, n_profit))
+    # Génération des codes activité
+    codes_activite = [f"ACT{i:03d}" for i in range(1, 101)]
     
-    # Seuils de classification
-    theta_C = np.percentile(C0, 70)  # 0.70
-    theta_R = np.percentile(R0, 70)  # 0.14
+    # Data ELR
+    elr_data = pd.DataFrame({
+        'Code activité': codes_activite,
+        'Pol Formule': ['Atout PRO'] * 100,
+        'Libellé': [f'Activité {i}' for i in range(1, 101)],
+        'Pourcentage ELR': np.random.uniform(5, 25, 100)
+    })
     
-    # Classification des segments
-    segment_types = classify_segments(C0, R0, theta_C, theta_R, n_conv, n_profit)
+    # Data Tarif Vendu
+    tarif_data = pd.DataFrame({
+        'Code_acti_ET100': codes_activite,
+        'Produit': ['AtoutsPRO'] * 100,
+        'FORMULE': ['Atout PRO'] * 100,
+        'Nombre_AN24': np.random.randint(10, 500, 100),
+        'Somme_tarif_vendu': np.random.uniform(50000, 2000000, 100),
+        'Somme_tarif_vendu_SansFDR': lambda x: x * 0.95,
+        'moyenne_tarif_vendu_HT': np.random.uniform(1000, 15000, 100),
+        'moyenne_tarif_vendu_SansFDR': lambda x: x * 0.95
+    })
     
-    # Coefficients de bonus/pénalité
-    lambda_A = 10.0  # Pénalise majoration élevée
-    lambda_B = 5.0   # Encourage majoration
-    lambda_C = 3.0   # Encourage protection
-    lambda_D = 8.0   # Encourage forte majoration
+    # Calcul des colonnes dérivées
+    tarif_data['Somme_tarif_vendu_SansFDR'] = tarif_data['Somme_tarif_vendu'] * 0.95
+    tarif_data['moyenne_tarif_vendu_SansFDR'] = tarif_data['moyenne_tarif_vendu_HT'] * 0.95
     
-    return {
-        'n_conv': n_conv,
-        'n_profit': n_profit,
-        'C0': C0,
-        'R0': R0,
-        'volumes': volumes,
-        'elasticity': elasticity,
-        'theta_C': theta_C,
-        'theta_R': theta_R,
-        'segment_types': segment_types,
-        'lambda_A': lambda_A,
-        'lambda_B': lambda_B,
-        'lambda_C': lambda_C,
-        'lambda_D': lambda_D
-    }
+    # Data marché
+    marche_data = pd.DataFrame({
+        'CodeActivite_AtoutsPro': codes_activite,
+        'marché_réel': np.random.choice(['Automobile', 'Habitation', 'Professionnel', 'Santé', 'Loisirs'], 100)
+    })
+    
+    # Taux de concrétisation
+    taux_data = pd.DataFrame({
+        'Code': codes_activite,
+        'Taux_Concretisation': np.random.uniform(0.15, 0.85, 100)
+    })
+    
+    return elr_data, tarif_data, marche_data, taux_data
 
-def classify_segments(C0: np.ndarray, R0: np.ndarray, theta_C: float, theta_R: float, 
-                     n_conv: int, n_profit: int) -> np.ndarray:
-    """Classification des segments selon les formules définies"""
-    segments = np.empty((n_conv, n_profit), dtype=object)
+def create_segments(data, column, n_segments, prefix):
+    """Créer des segments basés sur les quantiles"""
+    quantiles = np.linspace(0, 1, n_segments + 1)
+    segment_bounds = data[column].quantile(quantiles).values
     
-    for j in range(n_conv):
-        for k in range(n_profit):
-            if C0[j] >= theta_C and R0[k] >= theta_R:
-                segments[j, k] = SegmentType.A
-            elif C0[j] >= theta_C and R0[k] < theta_R:
-                segments[j, k] = SegmentType.B
-            elif C0[j] < theta_C and R0[k] >= theta_R:
-                segments[j, k] = SegmentType.C
-            else:
-                segments[j, k] = SegmentType.D
+    segments = []
+    for i in range(n_segments):
+        segments.append({
+            'Groupe': f'{prefix}_{i+1:02d}',
+            'Min': segment_bounds[i],
+            'Max': segment_bounds[i+1]
+        })
     
-    return segments
+    return pd.DataFrame(segments)
 
-def conversion_function(m_jk: float, j: int, k: int, params: Dict) -> float:
-    """
-    Fonction de conversion avec élasticité: C_{j,k}(m_{j,k}) = C_{j,0} * (1 + m_{j,k})^{-ε_{j,k}}
-    """
-    return params['C0'][j] * np.power(1 + m_jk, -params['elasticity'][j, k])
+def assign_segment(value, segments_df, min_col='Min', max_col='Max'):
+    """Assigner un segment à une valeur"""
+    for _, segment in segments_df.iterrows():
+        if segment[min_col] <= value <= segment[max_col]:
+            return segment['Groupe']
+    return segments_df.iloc[-1]['Groupe']  # Dernier segment par défaut
 
-def adjusted_profitability(m_jk: float, j: int, k: int, params: Dict) -> float:
-    """
-    Rentabilité ajustée: R_{j,k}(m_{j,k}) = R_{0,k} + α_{j,k} * m_{j,k} + β_{j,k}(m_{j,k})
-    """
-    base_profitability = params['R0'][k]
-    alpha = 0.1  # Coefficient linéaire
+def prepare_data():
+    """Préparer toutes les données selon le cahier des charges"""
+    elr_data, tarif_data, marche_data, taux_data = create_sample_data()
     
-    # Bonus/Pénalité selon le type de segment
-    segment_type = params['segment_types'][j, k]
+    # 1. Filtrage ELR pour "Atout PRO"
+    elr_atouts_pro = elr_data[elr_data['Pol Formule'] == 'Atout PRO'].copy()
     
-    if segment_type == SegmentType.A:
-        beta = -params['lambda_A'] * m_jk**2  # Pénalise majoration élevée
-    elif segment_type == SegmentType.B:
-        beta = params['lambda_B'] * m_jk      # Encourage majoration
-    elif segment_type == SegmentType.C:
-        beta = -params['lambda_C'] * m_jk     # Encourage protection
-    else:  # SegmentType.D
-        beta = params['lambda_D'] * m_jk**2   # Encourage forte majoration
+    # 2. Créer des segments ELR (20 groupes)
+    segment_elr = create_segments(elr_atouts_pro, 'Pourcentage ELR', 20, 'ELR')
     
-    return base_profitability + alpha * m_jk + beta
-
-def get_bounds(j: int, k: int, params: Dict) -> Tuple[float, float]:
-    """Contraintes de bornes selon le type de segment"""
-    segment_type = params['segment_types'][j, k]
+    # 3. Filtrer Tarif Vendu pour "AtoutsPRO"
+    tarif_atoutspro = tarif_data[tarif_data['Produit'] == 'AtoutsPRO'].copy()
     
-    bounds = {
-        SegmentType.A: (0.0, 0.05),    # Protéger
-        SegmentType.B: (0.12, 0.30),   # Majorer fort
-        SegmentType.C: (0.03, 0.12),   # Modéré
-        SegmentType.D: (0.20, 0.40)    # Décourager
-    }
-    
-    return bounds[segment_type]
-
-def evaluate_objectives(majoration_rates: np.ndarray, params: Dict) -> Tuple[float, float]:
-    """
-    Évalue les deux objectifs:
-    f1 = Profit total
-    f2 = Taux de conversion global
-    """
-    m_matrix = majoration_rates.reshape(params['n_conv'], params['n_profit'])
-    total_profit = 0.0
-    total_weighted_conversion = 0.0
-    total_volume = 0.0
-    
-    for j in range(params['n_conv']):
-        for k in range(params['n_profit']):
-            m_jk = m_matrix[j, k]
-            
-            # Calculs selon les formules
-            conversion = conversion_function(m_jk, j, k, params)
-            profitability = adjusted_profitability(m_jk, j, k, params)
-            volume = params['volumes'][j, k]
-            
-            # Contribution au profit total
-            segment_profit = volume * conversion * profitability * (1 + m_jk)
-            total_profit += segment_profit
-            
-            # Contribution à la conversion globale
-            total_weighted_conversion += volume * conversion
-            total_volume += volume
-    
-    # Objectifs à maximiser
-    f1 = total_profit  # Profit total
-    f2 = total_weighted_conversion / total_volume  # Conversion globale
-    
-    return f1, f2
-
-def create_individual(majoration_rates: np.ndarray, params: Dict) -> Individual:
-    """Crée un individu avec évaluation des objectifs"""
-    objectives = evaluate_objectives(majoration_rates, params)
-    return Individual(
-        majoration_rates=majoration_rates,
-        objectives=objectives,
-        rank=0,
-        crowding_distance=0.0
+    # 4. Fusion ELR + Tarif Vendu
+    data_all = pd.merge(
+        elr_atouts_pro,
+        tarif_atoutspro,
+        left_on='Code activité',
+        right_on='Code_acti_ET100',
+        how='inner'
     )
+    
+    # 5. Enrichissement avec marché
+    data_all = pd.merge(
+        data_all,
+        marche_data,
+        left_on='Code activité',
+        right_on='CodeActivite_AtoutsPro',
+        how='left'
+    )
+    data_all.rename(columns={'marché_réel': 'marché'}, inplace=True)
+    
+    # 6. Fusion avec taux de concrétisation
+    data_all_fusione = pd.merge(
+        data_all,
+        taux_data,
+        left_on='Code activité',
+        right_on='Code',
+        how='left'
+    )
+    
+    # 7. Créer des segments de taux de concrétisation (10 groupes)
+    segment_taux = create_segments(data_all_fusione, 'Taux_Concretisation', 10, 'TAUX')
+    
+    # 8. Assigner les segments aux données
+    data_all_fusione['Segment_ELR'] = data_all_fusione['Pourcentage ELR'].apply(
+        lambda x: assign_segment(x, segment_elr)
+    )
+    data_all_fusione['Segment_Taux'] = data_all_fusione['Taux_Concretisation'].apply(
+        lambda x: assign_segment(x, segment_taux)
+    )
+    
+    return data_all_fusione, segment_elr, segment_taux
 
-def initialize_population(population_size: int, params: Dict) -> List[Individual]:
-    """Initialise la population avec des contraintes de bornes"""
-    population = []
-    
-    for _ in range(population_size):
-        majoration_rates = np.zeros((params['n_conv'], params['n_profit']))
-        
-        for j in range(params['n_conv']):
-            for k in range(params['n_profit']):
-                min_bound, max_bound = get_bounds(j, k, params)
-                majoration_rates[j, k] = np.random.uniform(min_bound, max_bound)
-        
-        individual = create_individual(majoration_rates.flatten(), params)
-        population.append(individual)
-    
-    return population
-
-def dominates(ind1: Individual, ind2: Individual) -> bool:
-    """Test de dominance de Pareto"""
-    f1_1, f2_1 = ind1.objectives
-    f1_2, f2_2 = ind2.objectives
-    
-    # Pour maximisation des deux objectifs
-    return (f1_1 >= f1_2 and f2_1 >= f2_2) and (f1_1 > f1_2 or f2_1 > f2_2)
-
-def fast_non_dominated_sort(population: List[Individual]) -> List[List[Individual]]:
-    """
-    Tri rapide non-dominé O(MN²)
-    Algorithme de Deb et al. (2002)
-    """
-    fronts = [[]]
-    
-    # Ajouter des attributs temporaires aux individus
-    for p in population:
-        p.domination_count = 0
-        p.dominated_solutions = []
-        
-        for q in population:
-            if dominates(p, q):
-                p.dominated_solutions.append(q)
-            elif dominates(q, p):
-                p.domination_count += 1
-        
-        if p.domination_count == 0:
-            p.rank = 0
-            fronts[0].append(p)
-    
-    i = 0
-    while len(fronts[i]) > 0:
-        next_front = []
-        for p in fronts[i]:
-            for q in p.dominated_solutions:
-                q.domination_count -= 1
-                if q.domination_count == 0:
-                    q.rank = i + 1
-                    next_front.append(q)
-        i += 1
-        fronts.append(next_front)
-    
-    return fronts[:-1]  # Enlever le dernier front vide
-
-def calculate_crowding_distance(front: List[Individual]):
-    """
-    Calcul de la distance de crowding
-    Algorithme de Deb et al. (2002)
-    """
-    if len(front) <= 2:
-        for individual in front:
-            individual.crowding_distance = float('inf')
-        return
-    
-    # Initialiser toutes les distances à 0
-    for individual in front:
-        individual.crowding_distance = 0.0
-    
-    # Pour chaque objectif
-    for obj_idx in range(2):  # 2 objectifs
-        # Trier par objectif
-        front.sort(key=lambda x: x.objectives[obj_idx], reverse=True)
-        
-        # Points extrêmes ont une distance infinie
-        front[0].crowding_distance = float('inf')
-        front[-1].crowding_distance = float('inf')
-        
-        # Normalisation
-        obj_range = front[0].objectives[obj_idx] - front[-1].objectives[obj_idx]
-        if obj_range == 0:
-            continue
-        
-        # Calculer les distances
-        for i in range(1, len(front) - 1):
-            distance = (front[i-1].objectives[obj_idx] - front[i+1].objectives[obj_idx]) / obj_range
-            front[i].crowding_distance += distance
-
-def tournament_selection(population: List[Individual]) -> Individual:
-    """Sélection par tournoi avec rang et distance de crowding"""
-    candidate1 = random.choice(population)
-    candidate2 = random.choice(population)
-    
-    # Comparer selon NSGA-II
-    if candidate1.rank < candidate2.rank:
-        return candidate1
-    elif candidate1.rank > candidate2.rank:
-        return candidate2
-    else:
-        # Même rang, utiliser la distance de crowding
-        return candidate1 if candidate1.crowding_distance > candidate2.crowding_distance else candidate2
-
-def sbx_crossover(parent1: Individual, parent2: Individual, crossover_prob: float, 
-                 eta_c: float, params: Dict) -> Tuple[Individual, Individual]:
-    """Croisement SBX (Simulated Binary Crossover)"""
-    if random.random() > crossover_prob:
-        return parent1, parent2
-    
-    child1_genes = np.copy(parent1.majoration_rates)
-    child2_genes = np.copy(parent2.majoration_rates)
-    
-    for i in range(len(child1_genes)):
-        if random.random() <= 0.5:
-            j = i // params['n_profit']
-            k = i % params['n_profit']
-            
-            min_bound, max_bound = get_bounds(j, k, params)
-            
-            y1, y2 = child1_genes[i], child2_genes[i]
-            
-            if abs(y1 - y2) > 1e-14:
-                if y1 > y2:
-                    y1, y2 = y2, y1
-                
-                beta = 1.0 + 2.0 * (y1 - min_bound) / (y2 - y1)
-                alpha = 2.0 - beta ** -(eta_c + 1.0)
-                
-                if random.random() <= 1.0 / alpha:
-                    betaq = (random.random() * alpha) ** (1.0 / (eta_c + 1.0))
-                else:
-                    betaq = (1.0 / (2.0 - random.random() * alpha)) ** (1.0 / (eta_c + 1.0))
-                
-                c1 = 0.5 * ((y1 + y2) - betaq * (y2 - y1))
-                
-                beta = 1.0 + 2.0 * (max_bound - y2) / (y2 - y1)
-                alpha = 2.0 - beta ** -(eta_c + 1.0)
-                
-                if random.random() <= 1.0 / alpha:
-                    betaq = (random.random() * alpha) ** (1.0 / (eta_c + 1.0))
-                else:
-                    betaq = (1.0 / (2.0 - random.random() * alpha)) ** (1.0 / (eta_c + 1.0))
-                
-                c2 = 0.5 * ((y1 + y2) + betaq * (y2 - y1))
-                
-                c1 = np.clip(c1, min_bound, max_bound)
-                c2 = np.clip(c2, min_bound, max_bound)
-                
-                if random.random() <= 0.5:
-                    child1_genes[i] = c2
-                    child2_genes[i] = c1
-                else:
-                    child1_genes[i] = c1
-                    child2_genes[i] = c2
-    
-    child1 = create_individual(child1_genes, params)
-    child2 = create_individual(child2_genes, params)
-    
-    return child1, child2
-
-def polynomial_mutation(individual: Individual, mutation_prob: float, eta_m: float, 
-                       params: Dict) -> Individual:
-    """Mutation polynomiale"""
-    mutated_genes = np.copy(individual.majoration_rates)
-    
-    for i in range(len(mutated_genes)):
-        if random.random() <= mutation_prob:
-            j = i // params['n_profit']
-            k = i % params['n_profit']
-            
-            min_bound, max_bound = get_bounds(j, k, params)
-            
-            y = mutated_genes[i]
-            delta1 = (y - min_bound) / (max_bound - min_bound)
-            delta2 = (max_bound - y) / (max_bound - min_bound)
-            
-            rnd = random.random()
-            mut_pow = 1.0 / (eta_m + 1.0)
-            
-            if rnd <= 0.5:
-                xy = 1.0 - delta1
-                val = 2.0 * rnd + (1.0 - 2.0 * rnd) * (xy ** (eta_m + 1.0))
-                deltaq = val ** mut_pow - 1.0
-            else:
-                xy = 1.0 - delta2
-                val = 2.0 * (1.0 - rnd) + 2.0 * (rnd - 0.5) * (xy ** (eta_m + 1.0))
-                deltaq = 1.0 - val ** mut_pow
-            
-            y = y + deltaq * (max_bound - min_bound)
-            y = np.clip(y, min_bound, max_bound)
-            mutated_genes[i] = y
-    
-    return create_individual(mutated_genes, params)
-
-def nsga2_optimize(population_size: int = 100, max_generations: int = 500, 
-                  crossover_prob: float = 0.8, eta_c: float = 15, eta_m: float = 20,
-                  params: Dict = None) -> Tuple[List[Individual], Dict]:
-    """
-    Algorithme NSGA-II principal
-    Retourne le front de Pareto et les statistiques
-    """
-    if params is None:
-        params = setup_problem_parameters()
-    
-    # Probabilité de mutation
-    mutation_prob = 1.0 / (params['n_conv'] * params['n_profit'])
-    
-    # Initialisation
-    population = initialize_population(population_size, params)
-    
-    # Statistiques
-    stats = {
-        'best_profit': [],
-        'best_conversion': [],
-        'average_profit': [],
-        'average_conversion': []
+def calculate_kpis(df):
+    """Calculer les indicateurs clés"""
+    kpis = {
+        'Total_AN24': df['Nombre_AN24'].sum(),
+        'Taux_Concretisation_Global': df['Taux_Concretisation'].mean(),
+        'Total_Tarif_Vendu': df['Somme_tarif_vendu'].sum(),
+        'Total_Tarif_Vendu_SansFDR': df['Somme_tarif_vendu_SansFDR'].sum(),
+        'Nb_Activites': df['Code activité'].nunique()
     }
-    
-    for generation in range(max_generations):
-        # Créer la descendance
-        offspring = []
-        
-        while len(offspring) < population_size:
-            parent1 = tournament_selection(population)
-            parent2 = tournament_selection(population)
-            
-            child1, child2 = sbx_crossover(parent1, parent2, crossover_prob, eta_c, params)
-            child1 = polynomial_mutation(child1, mutation_prob, eta_m, params)
-            child2 = polynomial_mutation(child2, mutation_prob, eta_m, params)
-            
-            offspring.extend([child1, child2])
-        
-        offspring = offspring[:population_size]
-        
-        # Combiner population et descendance
-        combined_population = population + offspring
-        
-        # Tri non-dominé rapide
-        fronts = fast_non_dominated_sort(combined_population)
-        
-        # Nouvelle population
-        new_population = []
-        front_idx = 0
-        
-        while len(new_population) + len(fronts[front_idx]) <= population_size:
-            calculate_crowding_distance(fronts[front_idx])
-            new_population.extend(fronts[front_idx])
-            front_idx += 1
-        
-        # Compléter avec le front suivant si nécessaire
-        if len(new_population) < population_size:
-            calculate_crowding_distance(fronts[front_idx])
-            fronts[front_idx].sort(key=lambda x: x.crowding_distance, reverse=True)
-            remaining = population_size - len(new_population)
-            new_population.extend(fronts[front_idx][:remaining])
-        
-        population = new_population
-        
-        # Statistiques
-        profits = [ind.objectives[0] for ind in population]
-        conversions = [ind.objectives[1] for ind in population]
-        
-        stats['best_profit'].append(max(profits))
-        stats['best_conversion'].append(max(conversions))
-        stats['average_profit'].append(np.mean(profits))
-        stats['average_conversion'].append(np.mean(conversions))
-        
-        if generation % 50 == 0:
-            print(f"Génération {generation}: Meilleur profit = {max(profits):.2f}, Meilleure conversion = {max(conversions):.4f}")
-    
-    # Retourner le front de Pareto (premier front)
-    final_fronts = fast_non_dominated_sort(population)
-    pareto_front = final_fronts[0]
-    
-    return pareto_front, stats
+    return kpis
 
-def analyze_results(pareto_front: List[Individual], params: Dict) -> Individual:
-    """Analyse des résultats d'optimisation"""
-    print(f"\n=== ANALYSE DES RÉSULTATS ===")
-    print(f"Taille du front de Pareto: {len(pareto_front)}")
+def create_majoration_matrix(segment_elr, segment_taux, sigma, alpha_range, beta_range):
+    """Créer la matrice de majoration"""
+    n_taux = len(segment_taux)  # 10
+    n_elr = len(segment_elr)    # 20
     
-    # Statistiques du front de Pareto
-    profits = [ind.objectives[0] for ind in pareto_front]
-    conversions = [ind.objectives[1] for ind in pareto_front]
+    # Initialiser la matrice
+    matrix = np.zeros((n_taux, n_elr))
     
-    print(f"\nProfit:")
-    print(f"  Min: {min(profits):.2f}")
-    print(f"  Max: {max(profits):.2f}")
-    print(f"  Moyenne: {np.mean(profits):.2f}")
+    # Calculer les pas alpha et beta
+    alpha_total = sigma * 0.6  # 60% de la variation pour les taux
+    beta_total = sigma * 0.4   # 40% de la variation pour ELR
     
-    print(f"\nTaux de conversion:")
-    print(f"  Min: {min(conversions):.4f}")
-    print(f"  Max: {max(conversions):.4f}")
-    print(f"  Moyenne: {np.mean(conversions):.4f}")
+    # Distribution des pas (plus important pour les segments à risque)
+    alphas = np.linspace(alpha_total/n_taux * 0.5, alpha_total/n_taux * 1.5, n_taux-1)
+    betas = np.linspace(beta_total/n_elr * 0.5, beta_total/n_elr * 1.5, n_elr-1)
     
-    # Analyser les taux de majoration par type de segment
-    best_solution = max(pareto_front, key=lambda x: x.objectives[0])  # Meilleur profit
+    # Remplir la matrice
+    matrix[0, 0] = sigma  # M_{1,1} = sigma
     
-    print(f"\n=== SOLUTION OPTIMALE (Meilleur profit) ===")
+    # Remplir la première ligne
+    for j in range(1, n_elr):
+        matrix[0, j] = max(0.1, matrix[0, j-1] - betas[j-1])
     
-    segment_stats = {seg_type: [] for seg_type in SegmentType}
+    # Remplir la première colonne
+    for i in range(1, n_taux):
+        matrix[i, 0] = max(0.1, matrix[i-1, 0] - alphas[i-1])
     
-    majoration_matrix = best_solution.majoration_rates.reshape(params['n_conv'], params['n_profit'])
+    # Remplir le reste de la matrice
+    for i in range(1, n_taux):
+        for j in range(1, n_elr):
+            matrix[i, j] = max(0.1, (matrix[i-1, j] + matrix[i, j-1]) / 2 - (alphas[i-1] + betas[j-1]) / 4)
     
-    for j in range(params['n_conv']):
-        for k in range(params['n_profit']):
-            seg_type = params['segment_types'][j, k]
-            majoration = majoration_matrix[j, k]
-            segment_stats[seg_type].append(majoration)
-    
-    for seg_type, majorations in segment_stats.items():
-        if majorations:
-            print(f"\nSegment {seg_type.value}:")
-            print(f"  Nombre: {len(majorations)}")
-            print(f"  Majoration moyenne: {np.mean(majorations):.3f}")
-            print(f"  Majoration min-max: [{min(majorations):.3f}, {max(majorations):.3f}]")
-    
-    return best_solution
+    return matrix
 
-def plot_results(pareto_front: List[Individual], stats: Dict, best_solution: Individual, params: Dict):
-    """Visualisation des résultats"""
-    plt.figure(figsize=(15, 5))
-    
-    # Front de Pareto
-    plt.subplot(1, 3, 1)
-    profits = [ind.objectives[0] for ind in pareto_front]
-    conversions = [ind.objectives[1] for ind in pareto_front]
-    plt.scatter(profits, conversions, c='red', alpha=0.7)
-    plt.xlabel('Profit Total')
-    plt.ylabel('Taux de Conversion Global')
-    plt.title('Front de Pareto')
-    plt.grid(True)
-    
-    # Évolution du profit
-    plt.subplot(1, 3, 2)
-    plt.plot(stats['best_profit'], label='Meilleur', color='red')
-    plt.plot(stats['average_profit'], label='Moyen', color='blue')
-    plt.xlabel('Génération')
-    plt.ylabel('Profit')
-    plt.title('Évolution du Profit')
-    plt.legend()
-    plt.grid(True)
-    
-    # Évolution de la conversion
-    plt.subplot(1, 3, 3)
-    plt.plot(stats['best_conversion'], label='Meilleure', color='red')
-    plt.plot(stats['average_conversion'], label='Moyenne', color='blue')
-    plt.xlabel('Génération')
-    plt.ylabel('Taux de Conversion')
-    plt.title('Évolution de la Conversion')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-
+# Interface utilisateur
 def main():
-    """Fonction principale"""
-    print("=== OPTIMISATION NSGA-II DES TAUX DE MAJORATION D'ASSURANCE ===")
-    print("Basé sur: Deb, K. et al. (2002) NSGA-II: IEEE Trans. Evolutionary Computation")
+    # Sidebar pour les paramètres
+    st.sidebar.header("⚙️ Paramètres")
     
-    # Initialiser les paramètres
-    params = setup_problem_parameters()
+    # Chargement des données
+    with st.spinner("Chargement des données..."):
+        data_all_fusione, segment_elr, segment_taux = prepare_data()
     
-    # Afficher la classification des segments
-    print(f"\nClassification des segments (seuils: Conv≥{params['theta_C']:.2f}, Rent≥{params['theta_R']:.3f}):")
-    type_counts = {}
-    for j in range(params['n_conv']):
-        for k in range(params['n_profit']):
-            seg_type = params['segment_types'][j, k]
-            type_counts[seg_type.value] = type_counts.get(seg_type.value, 0) + 1
+    # Onglets principaux
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📈 Analyse Globale", 
+        "🔗 Corrélations", 
+        "🎯 Filtrage par Activité", 
+        "📋 Matrice de Majoration"
+    ])
     
-    for seg_type, count in type_counts.items():
-        print(f"  Segment {seg_type}: {count} combinaisons")
+    # TAB 1: Analyse Globale
+    with tab1:
+        st.header("📊 Vue d'ensemble des données")
+        
+        # KPIs
+        kpis = calculate_kpis(data_all_fusione)
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric(
+                "Total AN24",
+                f"{kpis['Total_AN24']:,}",
+                help="Nombre total d'affaires nouvelles"
+            )
+        
+        with col2:
+            st.metric(
+                "Taux Concrétisation Global",
+                f"{kpis['Taux_Concretisation_Global']:.1%}",
+                help="Ratio entre affaires conclues et totales"
+            )
+        
+        with col3:
+            st.metric(
+                "CA Total",
+                f"€{kpis['Total_Tarif_Vendu']:,.0f}",
+                help="Chiffre d'affaires total"
+            )
+        
+        with col4:
+            st.metric(
+                "CA sans FDR",
+                f"€{kpis['Total_Tarif_Vendu_SansFDR']:,.0f}",
+                help="Chiffre d'affaires hors frais de dossier"
+            )
+        
+        with col5:
+            st.metric(
+                "Nb Activités",
+                f"{kpis['Nb_Activites']}",
+                help="Nombre d'activités différentes"
+            )
+        
+        st.markdown("---")
+        
+        # Graphiques
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Répartition par marché
+            marche_data = data_all_fusione.groupby('marché').agg({
+                'Nombre_AN24': 'sum',
+                'Somme_tarif_vendu': 'sum'
+            }).reset_index()
+            
+            fig_marche = px.pie(
+                marche_data, 
+                values='Nombre_AN24', 
+                names='marché',
+                title="Répartition des AN24 par Marché"
+            )
+            st.plotly_chart(fig_marche, use_container_width=True)
+        
+        with col2:
+            # Top 10 activités
+            top_activites = data_all_fusione.nlargest(10, 'Nombre_AN24')[
+                ['Code activité', 'Nombre_AN24', 'Libellé']
+            ]
+            
+            fig_top = px.bar(
+                top_activites,
+                x='Nombre_AN24',
+                y='Code activité',
+                orientation='h',
+                title="Top 10 Activités par AN24"
+            )
+            fig_top.update_layout(yaxis={'categoryorder': 'total ascending'})
+            st.plotly_chart(fig_top, use_container_width=True)
+        
+        # Distribution des indicateurs
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_elr = px.histogram(
+                data_all_fusione,
+                x='Pourcentage ELR',
+                nbins=30,
+                title="Distribution des Pourcentages ELR"
+            )
+            st.plotly_chart(fig_elr, use_container_width=True)
+        
+        with col2:
+            fig_taux = px.histogram(
+                data_all_fusione,
+                x='Taux_Concretisation',
+                nbins=30,
+                title="Distribution des Taux de Concrétisation"
+            )
+            st.plotly_chart(fig_taux, use_container_width=True)
+        
+        # Tableau des données
+        st.subheader("📋 Données détaillées")
+        st.dataframe(
+            data_all_fusione[[
+                'Code activité', 'Libellé', 'marché', 'Pourcentage ELR',
+                'Taux_Concretisation', 'Nombre_AN24', 'Somme_tarif_vendu'
+            ]].round(2),
+            use_container_width=True
+        )
     
-    # Lancer l'optimisation
-    print("\nDémarrage de l'optimisation NSGA-II...")
-    pareto_front, stats = nsga2_optimize(params=params)
+    # TAB 2: Corrélations
+    with tab2:
+        st.header("🔗 Analyse de Corrélation ELR vs Taux de Concrétisation")
+        
+        # Calcul de la corrélation
+        corr_coef, p_value = pearsonr(
+            data_all_fusione['Pourcentage ELR'],
+            data_all_fusione['Taux_Concretisation']
+        )
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Coefficient de Corrélation", f"{corr_coef:.3f}")
+        with col2:
+            st.metric("P-value", f"{p_value:.3f}")
+        with col3:
+            interpretation = "Forte" if abs(corr_coef) > 0.7 else "Modérée" if abs(corr_coef) > 0.3 else "Faible"
+            st.metric("Interprétation", interpretation)
+        
+        # Scatter plot avec ligne de tendance
+        fig_scatter = px.scatter(
+            data_all_fusione,
+            x='Pourcentage ELR',
+            y='Taux_Concretisation',
+            size='Nombre_AN24',
+            color='marché',
+            trendline='ols',
+            title=f"Corrélation ELR vs Taux de Concrétisation (r={corr_coef:.3f})",
+            labels={
+                'Pourcentage ELR': 'Pourcentage ELR (%)',
+                'Taux_Concretisation': 'Taux de Concrétisation'
+            }
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+        
+        # Heatmap de corrélation
+        correlation_vars = [
+            'Pourcentage ELR', 'Taux_Concretisation', 'Nombre_AN24',
+            'Somme_tarif_vendu', 'moyenne_tarif_vendu_HT'
+        ]
+        
+        corr_matrix = data_all_fusione[correlation_vars].corr()
+        
+        fig_heatmap = px.imshow(
+            corr_matrix,
+            text_auto=True,
+            aspect="auto",
+            title="Matrice de Corrélation",
+            color_continuous_scale='RdBu_r'
+        )
+        st.plotly_chart(fig_heatmap, use_container_width=True)
     
-    # Analyser les résultats
-    best_solution = analyze_results(pareto_front, params)
+    # TAB 3: Filtrage par Activité
+    with tab3:
+        st.header("🎯 Analyse par Code d'Activité")
+        
+        # Sélecteur d'activités
+        selected_activities = st.multiselect(
+            "Sélectionner les codes d'activité à analyser:",
+            options=data_all_fusione['Code activité'].unique(),
+            default=data_all_fusione['Code activité'].unique()[:5]
+        )
+        
+        if selected_activities:
+            filtered_data = data_all_fusione[
+                data_all_fusione['Code activité'].isin(selected_activities)
+            ]
+            
+            # KPIs filtrés
+            filtered_kpis = calculate_kpis(filtered_data)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total AN24 (filtrés)", f"{filtered_kpis['Total_AN24']:,}")
+            with col2:
+                st.metric("Taux Concrétisation Moyen", f"{filtered_kpis['Taux_Concretisation_Global']:.1%}")
+            with col3:
+                st.metric("CA Total (filtrés)", f"€{filtered_kpis['Total_Tarif_Vendu']:,.0f}")
+            
+            # Comparaison des activités sélectionnées
+            comparison_data = filtered_data.groupby('Code activité').agg({
+                'Nombre_AN24': 'sum',
+                'Pourcentage ELR': 'mean',
+                'Taux_Concretisation': 'mean',
+                'Somme_tarif_vendu': 'sum'
+            }).reset_index()
+            
+            fig_comparison = make_subplots(
+                rows=2, cols=2,
+                subplot_titles=('AN24 par Activité', 'ELR Moyen', 'Taux de Concrétisation', 'CA par Activité'),
+                specs=[[{"secondary_y": False}, {"secondary_y": False}],
+                       [{"secondary_y": False}, {"secondary_y": False}]]
+            )
+            
+            # AN24
+            fig_comparison.add_trace(
+                go.Bar(x=comparison_data['Code activité'], 
+                      y=comparison_data['Nombre_AN24'], 
+                      name='AN24'),
+                row=1, col=1
+            )
+            
+            # ELR
+            fig_comparison.add_trace(
+                go.Bar(x=comparison_data['Code activité'], 
+                      y=comparison_data['Pourcentage ELR'], 
+                      name='ELR %'),
+                row=1, col=2
+            )
+            
+            # Taux
+            fig_comparison.add_trace(
+                go.Bar(x=comparison_data['Code activité'], 
+                      y=comparison_data['Taux_Concretisation'], 
+                      name='Taux'),
+                row=2, col=1
+            )
+            
+            # CA
+            fig_comparison.add_trace(
+                go.Bar(x=comparison_data['Code activité'], 
+                      y=comparison_data['Somme_tarif_vendu'], 
+                      name='CA'),
+                row=2, col=2
+            )
+            
+            fig_comparison.update_layout(height=600, showlegend=False, title_text="Comparaison des Activités Sélectionnées")
+            st.plotly_chart(fig_comparison, use_container_width=True)
+            
+            # Tableau détaillé
+            st.subheader("Détails des activités sélectionnées")
+            st.dataframe(comparison_data.round(2), use_container_width=True)
     
-    # Visualisation
-    plot_results(pareto_front, stats, best_solution, params)
-    
-    print(f"\n=== MATRICE DES TAUX DE MAJORATION OPTIMAUX ===")
-    print("Lignes = Segments de conversion, Colonnes = Segments de rentabilité")
-    print(f"Matrice {params['n_conv']}x{params['n_profit']}:")
-    majoration_matrix = best_solution.majoration_rates.reshape(params['n_conv'], params['n_profit'])
-    print(np.round(majoration_matrix, 3))
+    # TAB 4: Matrice de Majoration
+    with tab4:
+        st.header("📋 Matrice de Majoration")
+        
+        # Paramètres de la matrice
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            sigma = st.slider(
+                "Valeur maximale σ (M₁,₁)",
+                min_value=1.0,
+                max_value=5.0,
+                value=2.5,
+                step=0.1,
+                help="Coefficient maximum de majoration"
+            )
+        
+        with col2:
+            st.write("**Paramètres des segments:**")
+            st.write(f"• Segments ELR: {len(segment_elr)}")
+            st.write(f"• Segments Taux: {len(segment_taux)}")
+            st.write(f"• Taille matrice: {len(segment_taux)} × {len(segment_elr)}")
+        
+        # Calcul de la matrice
+        alpha_range = (0.1, 0.3)
+        beta_range = (0.05, 0.2)
+        
+        matrix = create_majoration_matrix(segment_elr, segment_taux, sigma, alpha_range, beta_range)
+        
+        # Visualisation de la matrice
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            # Heatmap de la matrice
+            fig_matrix = px.imshow(
+                matrix,
+                labels=dict(x="Segments ELR", y="Segments Taux", color="Coefficient"),
+                x=[f"ELR_{i+1:02d}" for i in range(len(segment_elr))],
+                y=[f"TAUX_{i+1:02d}" for i in range(len(segment_taux))],
+                color_continuous_scale='RdYlBu_r',
+                title="Matrice de Majoration"
+            )
+            fig_matrix.update_layout(height=600)
+            st.plotly_chart(fig_matrix, use_container_width=True)
+        
+        with col2:
+            st.subheader("Statistiques de la matrice")
+            st.metric("Coefficient minimum", f"{matrix.min():.3f}")
+            st.metric("Coefficient maximum", f"{matrix.max():.3f}")
+            st.metric("Coefficient moyen", f"{matrix.mean():.3f}")
+            st.metric("Écart-type", f"{matrix.std():.3f}")
+            
+            # Affichage des segments critiques
+            st.subheader("Zones critiques")
+            max_pos = np.unravel_index(matrix.argmax(), matrix.shape)
+            min_pos = np.unravel_index(matrix.argmin(), matrix.shape)
+            
+            st.write(f"**Maximum:** TAUX_{max_pos[0]+1:02d} × ELR_{max_pos[1]+1:02d}")
+            st.write(f"Coefficient: {matrix[max_pos]:.3f}")
+            
+            st.write(f"**Minimum:** TAUX_{min_pos[0]+1:02d} × ELR_{min_pos[1]+1:02d}")
+            st.write(f"Coefficient: {matrix[min_pos]:.3f}")
+        
+        # Tableau de la matrice
+        st.subheader("Matrice détaillée")
+        
+        matrix_df = pd.DataFrame(
+            matrix,
+            columns=[f"ELR_{i+1:02d}" for i in range(len(segment_elr))],
+            index=[f"TAUX_{i+1:02d}" for i in range(len(segment_taux))]
+        )
+        
+        st.dataframe(matrix_df.round(3), use_container_width=True)
+        
+        # Export de la matrice
+        if st.button("📥 Télécharger la matrice"):
+            csv = matrix_df.to_csv()
+            st.download_button(
+                label="Télécharger CSV",
+                data=csv,
+                file_name=f"matrice_majoration_sigma_{sigma}.csv",
+                mime="text/csv"
+            )
 
 if __name__ == "__main__":
     main()
