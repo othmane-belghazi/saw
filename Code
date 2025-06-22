@@ -1,76 +1,170 @@
 import streamlit as st
-import numpy as np
 import pandas as pd
-import plotly.express as px
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# -------- Fonctions de calcul --------
-def compute_matrix(alpha, beta):
+##############################
+#      UTILITAIRES GÉNÉRAUX  #
+##############################
+
+def segment(series: pd.Series, n: int, method: str = "quantile") -> pd.Series:
+    """Retourne le numéro de segment 0..n-1 pour chaque valeur de la série."""
+    if method == "quantile":
+        return pd.qcut(series, n, labels=False, duplicates="drop")
+    elif method == "equal-width":
+        return pd.cut(series, n, labels=False, include_lowest=True)
+    else:
+        raise ValueError("Méthode inconnue : 'quantile' ou 'equal-width'.")
+
+
+def build_matrix(
+    df: pd.DataFrame,
+    n_elr: int,
+    n_conv: int,
+    method: str,
+    alpha: float,
+    beta: float,
+    smooth: bool,
+    n_full: int,
+):
+    """Construit la matrice de majoration.
+
+    Paramètres
+    ----------
+    df : DataFrame contenant les colonnes premium, loss, conversion (0-1)
+    n_elr, n_conv : nombre de segments
+    method : 'quantile' ou 'equal-width'
+    alpha, beta : pondérations (exposants) ELR vs Conversion
+    smooth : active la crédibilité limited-fluctuation
+    n_full : effectif de pleine crédibilité
+
+    Retourne (M, N, R, C) où :
+    * M : DataFrame matrice majorée et renormalisée (moyenne pondérée = 1)
+    * N : DataFrame effectifs
+    * R : DataFrame (n_elr,1) – facteurs ELR
+    * C : DataFrame (1,n_conv) – facteurs Concrétisation
     """
-    Construit M selon :
-    M[0,0] = 0
-    M[0,j] = M[0,j-1] + beta[j]
-    M[i,j] = M[i-1,j] + alpha[i]
-    """
-    I = len(alpha)
-    J = len(beta)
-    M = np.zeros((I, J))
-    # première ligne (i=0)
-    for j in range(1, J):
-        M[0, j] = M[0, j-1] + beta[j]
-    # reste (i>=1)
-    for i in range(1, I):
-        for j in range(J):
-            M[i, j] = M[i-1, j] + alpha[i]
-    return M
+    df = df.copy()
 
-# -------- Interface Streamlit --------
-st.title("Matrice de Majoration")
-st.write("*Dimensions :* 10 segments concrétisation (i=0…9) × 20 segments ELR (j=0…19)")
+    # Segmentation
+    df["elr_seg"] = segment(df["ELR"], n_elr, method)
+    df["conv_seg"] = segment(df["conversion"], n_conv, method)
 
-# Saisie des pas α et β par l'utilisateur
-st.sidebar.header("Pas α_i et β_j")
-with st.sidebar.expander("α_i (10 valeurs)", expanded=True):
-    alpha = [st.number_input(f"α_{i}", value=0.0, step=0.1, key=f"alpha_{i}") for i in range(10)]
-with st.sidebar.expander("β_j (20 valeurs)", expanded=False):
-    beta = [st.number_input(f"β_{j}", value=0.0, step=0.1, key=f"beta_{j}") for j in range(20)]
-alpha = np.array(alpha, dtype=float)
-beta = np.array(beta, dtype=float)
+    # Effectifs
+    N = df.pivot_table(
+        index="elr_seg", columns="conv_seg", values="premium", aggfunc="count", fill_value=0
+    ).astype(int)
 
-# Calcul de la matrice
-M = compute_matrix(alpha, beta)
+    # ELR moyens par segment + portefeuille
+    ELR_i = df.groupby("elr_seg").apply(lambda d: d["loss"].sum() / d["premium"].sum())
+    ELR_port = df["loss"].sum() / df["premium"].sum()
+    R = (ELR_i / ELR_port).values  # shape (n_elr,)
 
-# DataFrame
-df = pd.DataFrame(
-    M,
-    index=[f"i={i}" for i in range(M.shape[0])],
-    columns=[f"j={j}" for j in range(M.shape[1])]
-)
+    # Concrétisation moyenne par segment + portefeuille
+    Conv_j = df.groupby("conv_seg")["conversion"].mean()
+    Conv_port = df["conversion"].mean()
+    C = (Conv_j / Conv_port).values  # shape (n_conv,)
 
-# Visualisation interactive - table éditable
-st.subheader("Matrice éditable (tri/filtre)")
-st.data_editor(df, num_rows="fixed", width=None)
+    # Matrice brute (puissances alpha / beta)
+    m_brut = np.power.outer(R, np.ones_like(C)) ** alpha * np.power.outer(np.ones_like(R), C) ** beta
 
-# Visualisation interactive - heatmap
-st.subheader("Heatmap interactive")
-fig_heat = px.imshow(
-    M,
-    labels={"x": "ELR (j)", "y": "Concrétisation (i)", "color": "M"},
-    x=df.columns,
-    y=df.index,
-    aspect="auto"
-)
-fig_heat.update_traces(hovertemplate='i=%{y}<br>j=%{x}<br>M=%{z:.2f}')
-st.plotly_chart(fig_heat, use_container_width=True)
+    # Normalisation neutre
+    K_norm = (m_brut * N.values).sum() / N.values.sum()
+    M = m_brut / K_norm
 
-# Visualisation interactive - surface 3D
-st.subheader("Surface 3D interactive")
-# Axes pour surface
-x_labels = [int(col.split('=')[1]) for col in df.columns]
-y_labels = [int(idx.split('=')[1]) for idx in df.index]
-fig_surf = px.surface(
-    x=x_labels,
-    y=y_labels,
-    z=M,
-    labels={"x": "j (ELR)", "y": "i (Concrétisation)", "z": "M"}
-)
-st.plotly_chart(fig_surf, use_container_width=True)
+    # Crédibilité Limited-Fluctuation
+    if smooth:
+        Z = np.minimum(1.0, np.sqrt(N.values / n_full))
+        M = 1 + Z * (M - 1)
+        # renormalise après lissage
+        K_norm2 = (M * N.values).sum() / N.values.sum()
+        M /= K_norm2
+
+    # Conversions DataFrames pour display
+    M_df = pd.DataFrame(M, index=N.index, columns=N.columns)
+    R_df = pd.DataFrame(R, index=N.index, columns=["R_i"])
+    C_df = pd.DataFrame(C, index=["C_j"], columns=N.columns)
+
+    return M_df, N, R_df, C_df
+
+
+##############################
+#       APPLICATION UI       #
+##############################
+
+def main():
+    st.set_page_config(
+        page_title="Matrice Majoration – Cas pratique",
+        layout="wide",
+    )
+    st.title("🧩 Cas pratique : Construction interactive de la matrice de majoration")
+
+    with st.sidebar:
+        st.header("Paramètres")
+        uploaded = st.file_uploader("Données CSV (facultatif)")
+        n_elr = st.slider("Nb segments ELR", 5, 40, 20)
+        n_conv = st.slider("Nb segments Concrétisation", 5, 20, 10)
+        method = st.selectbox("Découpage", ["quantile", "equal-width"])
+        st.markdown("---")
+        st.subheader("Pondérations α / β")
+        alpha = st.slider("Poids ELR (α)", 0.0, 2.0, 1.0, 0.05)
+        beta = st.slider("Poids Concrétisation (β)", 0.0, 2.0, 1.0, 0.05)
+        st.markdown("---")
+        smooth = st.checkbox("Activer crédibilité Limited-Fluctuation", value=True)
+        n_full = st.number_input("Effectif pleine crédibilité N_F", 50, 10_000, 1_000, 50)
+        st.markdown("---")
+        st.caption("Si aucun fichier n'est fourni, un jeu simulé de 15 000 expositions est généré.")
+
+    # Import / simulation données
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+    else:
+        rng = np.random.default_rng(2025)
+        n = 15_000
+        premium = rng.uniform(150, 600, n)
+        loss_ratio = rng.beta(2.5, 5, n)
+        loss = premium * loss_ratio
+        conversion = rng.beta(2, 2, n)  # moyenne 0.5
+        df = pd.DataFrame({"premium": premium, "loss": loss, "conversion": conversion})
+
+    # Assure cohérence ELR
+    df["ELR"] = df["loss"] / df["premium"].replace(0, np.nan)
+
+    # Construction matrice
+    M, N, R_df, C_df = build_matrix(
+        df, n_elr, n_conv, method, alpha, beta, smooth, n_full
+    )
+
+    ##############################
+    #       VISUALISATIONS       #
+    ##############################
+
+    colM, colSide = st.columns((4, 1))
+
+    with colM:
+        st.subheader("Matrice de majoration normalisée")
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(M, cmap="RdYlGn", center=1, linewidths=0.3, ax=ax)
+        ax.set_xlabel("Segment Concrétisation j")
+        ax.set_ylabel("Segment ELR i")
+        st.pyplot(fig)
+
+    with colSide:
+        st.metric("Moyenne pondérée", f"{(M.values*N.values).sum()/N.values.sum():.4f}")
+        st.dataframe(R_df.style.format({"R_i": "{:.3f}"}), height=300)
+        st.dataframe(C_df.style.format("{:.3f}"))
+
+    ##############################
+    #     TÉLÉCHARGEMENTS        #
+    ##############################
+
+    st.markdown("---")
+    csv_M = M.to_csv().encode("utf-8")
+    st.download_button("📥 Télécharger matrice (CSV)", csv_M, "matrix_majoration.csv", "text/csv")
+    csv_N = N.to_csv().encode("utf-8")
+    st.download_button("📥 Télécharger effectifs (CSV)", csv_N, "effectifs.csv", "text/csv")
+
+
+if _name_ == "_main_":
+    main()
