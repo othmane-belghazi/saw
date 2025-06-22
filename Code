@@ -4,167 +4,158 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-##############################
-#      UTILITAIRES GÉNÉRAUX  #
-##############################
+###############################
+# 1. Utilitaires de segmentation
+###############################
 
-def segment(series: pd.Series, n: int, method: str = "quantile") -> pd.Series:
-    """Retourne le numéro de segment 0..n-1 pour chaque valeur de la série."""
+def segment_indices(series: pd.Series, bins: int, method: str = "quantile") -> pd.Series:
+    """Retourne un indice 1..bins pour chaque observation."""
     if method == "quantile":
-        return pd.qcut(series, n, labels=False, duplicates="drop")
+        return pd.qcut(series, bins, labels=False, duplicates="drop") + 1
     elif method == "equal-width":
-        return pd.cut(series, n, labels=False, include_lowest=True)
+        return pd.cut(series, bins, labels=False, include_lowest=True) + 1
     else:
-        raise ValueError("Méthode inconnue : 'quantile' ou 'equal-width'.")
+        raise ValueError("Méthode de segmentation inconnue")
 
+###############################
+# 2. Calcul de la matrice dynamique
+###############################
 
-def build_matrix(
+def calc_dynamic_matrix(
     df: pd.DataFrame,
     n_elr: int,
     n_conv: int,
-    method: str,
     alpha: float,
     beta: float,
-    smooth: bool,
-    n_full: int,
+    coeff_max: float,
+    k_cred: float,
+    seg_method: str = "quantile",
 ):
-    """Construit la matrice de majoration.
+    """Construit la matrice de coefficients selon la rampe dynamique.
 
-    Paramètres
-    ----------
-    df : DataFrame contenant les colonnes premium, loss, conversion (0-1)
-    n_elr, n_conv : nombre de segments
-    method : 'quantile' ou 'equal-width'
-    alpha, beta : pondérations (exposants) ELR vs Conversion
-    smooth : active la crédibilité limited-fluctuation
-    n_full : effectif de pleine crédibilité
-
-    Retourne (M, N, R, C) où :
-    * M : DataFrame matrice majorée et renormalisée (moyenne pondérée = 1)
-    * N : DataFrame effectifs
-    * R : DataFrame (n_elr,1) – facteurs ELR
-    * C : DataFrame (1,n_conv) – facteurs Concrétisation
+    Retourne la matrice finale, la matrice avant crédibilité,
+    la matrice Z (poids) et la matrice d'effectifs N.
     """
-    df = df.copy()
-
     # Segmentation
-    df["elr_seg"] = segment(df["ELR"], n_elr, method)
-    df["conv_seg"] = segment(df["conversion"], n_conv, method)
+    df = df.copy()
+    df["elr_seg"] = segment_indices(df["ELR"], n_elr, seg_method)
+    df["conv_seg"] = segment_indices(df["conversion"], n_conv, seg_method)
 
-    # Effectifs
-    N = df.pivot_table(
-        index="elr_seg", columns="conv_seg", values="premium", aggfunc="count", fill_value=0
-    ).astype(int)
+    # Effectifs par case
+    N = (
+        df.groupby(["elr_seg", "conv_seg"]).size().unstack(fill_value=0).astype(int)
+    )
 
-    # ELR moyens par segment + portefeuille
-    ELR_i = df.groupby("elr_seg").apply(lambda d: d["loss"].sum() / d["premium"].sum())
-    ELR_port = df["loss"].sum() / df["premium"].sum()
-    R = (ELR_i / ELR_port).values
+    # Rang 1..n
+    i_idx = np.arange(1, n_elr + 1)[:, None]
+    j_idx = np.arange(1, n_conv + 1)[None, :]
 
-    # Concrétisation moyenne par segment + portefeuille
-    Conv_j = df.groupby("conv_seg")["conversion"].mean()
-    Conv_port = df["conversion"].mean()
-    C = (Conv_j / Conv_port).values
+    # Score rampe
+    score = (i_idx / n_elr) ** alpha * (j_idx / n_conv) ** beta
 
-    # Matrice brute
-    m_brut = np.power.outer(R, np.ones_like(C)) ** alpha * np.power.outer(np.ones_like(R), C) ** beta
+    # Matrice brute bornée
+    F = 1 + (coeff_max - 1) * score
 
-    # Normalisation neutre
-    K_norm = (m_brut * N.values).sum() / N.values.sum()
-    M = m_brut / K_norm
+    # Neutralisation 1
+    K = (F * N.values).sum() / N.values.sum()
+    M = F / K
 
-    # Crédibilité Limited-Fluctuation
-    if smooth:
-        Z = np.minimum(1.0, np.sqrt(N.values / n_full))
-        M = 1 + Z * (M - 1)
-        # re-normalise
-        K_norm2 = (M * N.values).sum() / N.values.sum()
-        M /= K_norm2
+    # Crédibilité
+    Z = N / (N + k_cred)
+    M_cred = 1 + Z.values * (M - 1)
 
-    # Conversion en DataFrame
-    M_df = pd.DataFrame(M, index=N.index, columns=N.columns)
-    R_df = pd.DataFrame(R, index=N.index, columns=["R_i"])
-    C_df = pd.DataFrame(C, index=["C_j"], columns=N.columns)
+    # Neutralisation 2
+    K2 = (M_cred * N.values).sum() / N.values.sum()
+    M_final = M_cred / K2
 
-    return M_df, N, R_df, C_df
+    # Convert to DataFrame for display
+    M_df = pd.DataFrame(M_final, index=N.index, columns=N.columns)
+    M_pre_df = pd.DataFrame(M, index=N.index, columns=N.columns)
+    Z_df = Z.astype(float)
 
-##############################
-#         APP STREAMLIT      #
-##############################
+    return M_df, M_pre_df, Z_df, N
+
+###############################
+# 3. Application Streamlit
+###############################
 
 def main():
-    st.set_page_config(page_title="Matrice Majoration – Cas pratique", layout="wide")
-    st.title("🧩 Cas pratique : Matrice de majoration avec données simulées ou réelles")
+    st.set_page_config(page_title="Matrice dynamique ELR × Concrétisation", layout="wide")
+    st.title("📈 Matrice de majoration dynamique (ELR × Concrétisation)")
 
-    ########## BARRE LATÉRALE ##########
     with st.sidebar:
-        st.header("Choix des données")
-        mode_data = st.radio("Source", ["Génération aléatoire", "Importer CSV"], index=0)
-        if mode_data == "Importer CSV":
-            uploaded = st.file_uploader("Données CSV")
-        else:
-            uploaded = None
-            n_sim = st.number_input("Nb expositions simulées", 1_000, 100_000, 15_000, 1_000)
-            seed = st.number_input("Seed RNG", 0, 1_000_000, 2025, 1)
-            st.markdown("---")
-            st.markdown("### Paramètres simulation")
-            prem_min, prem_max = st.slider("Premium min / max", 50, 1000, (150, 600))
-            a_lr, b_lr = st.slider("Beta(α, β) pour ELR", 0.5, 10.0, (2.5, 5.0), 0.1)
-            a_cv, b_cv = st.slider("Beta(α, β) pour Concrétisation", 0.5, 10.0, (2.0, 2.0), 0.1)
-            st.caption("➜ Cliquer sur un autre champ pour régénérer")
-        st.markdown("---")
-        st.header("Paramètres matrice")
-        n_elr = st.slider("Nb segments ELR", 5, 40, 20)
-        n_conv = st.slider("Nb segments Concrétisation", 5, 20, 10)
-        method = st.selectbox("Découpage", ["quantile", "equal-width"])
-        alpha = st.slider("Poids ELR (α)", 0.0, 2.0, 1.0, 0.05)
-        beta = st.slider("Poids Concrétisation (β)", 0.0, 2.0, 1.0, 0.05)
-        smooth = st.checkbox("Crédibiliser (Limited-Fluctuation)", True)
-        n_full = st.number_input("Effectif pleine crédibilité N_F", 50, 10_000, 1_000, 50)
+        st.header("Paramètres")
+        uploaded = st.file_uploader("📂 Charger un CSV (colonnes: premium, loss, conversion)")
+        n_rows = st.slider("Taille échantillon (si données simulées)", 1000, 50000, 10000, 1000)
+        n_elr = st.number_input("Nombre de segments ELR", 5, 40, 20, 1)
+        n_conv = st.number_input("Nombre de segments Concrétisation", 5, 20, 10, 1)
+        seg_method = st.selectbox("Méthode de découpe", ["quantile", "equal-width"])
+        coeff_max = st.slider("Coefficient maximum (case extrême)", 1.05, 2.0, 1.30, 0.01)
+        alpha = st.slider("Poids risque (α)", 0.1, 2.0, 0.8, 0.05)
+        beta = st.slider("Poids concrétisation (β)", 0.1, 2.0, 0.6, 0.05)
+        k_cred = st.number_input("K crédibilité", 0.0, 10000.0, 2000.0, 100.0)
 
-    ########## GÉNÉRATION / IMPORT ##########
+    # Data ingestion ou simulation
     if uploaded is not None:
         df = pd.read_csv(uploaded)
+        if "ELR" not in df.columns:
+            df["ELR"] = df["loss"] / df["premium"].replace(0, np.nan)
+        if "conversion" not in df.columns:
+            st.error("La colonne 'conversion' est manquante dans le fichier")
+            st.stop()
     else:
-        rng = np.random.default_rng(int(seed))
-        premium = rng.uniform(prem_min, prem_max, int(n_sim))
-        loss_ratio = rng.beta(a_lr, b_lr, int(n_sim))
+        st.info("Données simulées générées aléatoirement")
+        rng = np.random.default_rng(42)
+        premium = rng.uniform(100, 500, size=n_rows)
+        loss_ratio = rng.beta(2, 5, size=n_rows)
         loss = premium * loss_ratio
-        conversion = rng.beta(a_cv, b_cv, int(n_sim))
-        df = pd.DataFrame({"premium": premium, "loss": loss, "conversion": conversion})
+        conversion = rng.beta(3, 2, size=n_rows)  # moyenne env 0.60
+        df = pd.DataFrame({"premium": premium, "loss": loss, "ELR": loss_ratio, "conversion": conversion})
 
-    # ELR cohérent
-    df["ELR"] = df["loss"] / df["premium"].replace(0, np.nan)
+    # Calcul de la matrice
+    M_final, M_pre, Z, N = calc_dynamic_matrix(
+        df, n_elr, n_conv, alpha, beta, coeff_max, k_cred, seg_method
+    )
 
-    ########## CONSTRUCTION MATRICE ##########
-    M, N, R_df, C_df = build_matrix(df, n_elr, n_conv, method, alpha, beta, smooth, n_full)
-
-    ########## AFFICHAGE ##########
-    st.subheader("Aperçu des premières lignes du jeu de données")
-    st.dataframe(df.head())
-
-    col_heat, col_side = st.columns((4, 1))
-    with col_heat:
-        st.subheader("Matrice de majoration normalisée")
-        fig, ax = plt.subplots(figsize=(9, 6))
-        sns.heatmap(M, cmap="RdYlGn", center=1, linewidths=0.3, ax=ax)
+    #########################
+    # Visualisations
+    #########################
+    col_main, col_side = st.columns([3, 1])
+    with col_main:
+        st.subheader("Coefficient final (après crédibilité)")
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.heatmap(M_final, cmap="coolwarm", center=1, linewidths=0.3, ax=ax)
         ax.set_xlabel("Segment Concrétisation j")
         ax.set_ylabel("Segment ELR i")
         st.pyplot(fig)
+
+        st.markdown("*Distribution des coefficients*")
+        fig2, ax2 = plt.subplots()
+        ax2.hist(M_final.values.flatten(), bins=30)
+        ax2.set_xlabel("Coefficient")
+        ax2.set_ylabel("Effectif cases")
+        st.pyplot(fig2)
+
     with col_side:
-        st.metric("Moyenne pondérée", f"{(M.values*N.values).sum()/N.values.sum():.4f}")
-        st.write("### Facteurs R_i (ELR)")
-        st.dataframe(R_df.style.format("{:.3f}"), height=300)
-        st.write("### Facteurs C_j (Concrétisation)")
-        st.dataframe(C_df.style.format("{:.3f}"))
+        st.subheader("Résumé pondéré")
+        avg_coeff = (M_final.values * N.values).sum() / N.values.sum()
+        st.metric("Moyenne pondérée", f"{avg_coeff:.4f}")
+        st.metric("Coeff. max réel", f"{M_final.max().max():.3f}")
+        st.metric("Coeff. min réel", f"{M_final.min().min():.3f}")
 
-    ########## TÉLÉCHARGEMENTS ##########
-    st.markdown("---")
-    csv_M = M.to_csv().encode("utf-8")
-    st.download_button("📥 Télécharger matrice (CSV)", csv_M, "matrix_majoration.csv", "text/csv")
-    csv_N = N.to_csv().encode("utf-8")
-    st.download_button("📥 Télécharger effectifs (CSV)", csv_N, "effectifs.csv", "text/csv")
+    #########################
+    # Téléchargements
+    #########################
+    csv_coeff = M_final.to_csv().encode("utf-8")
+    st.download_button("📥 Télécharger la matrice", csv_coeff, "coefficients.csv", "text/csv")
 
+    if st.checkbox("Afficher matrices intermédiaires"):
+        st.write("Matrice avant crédibilité")
+        st.dataframe(M_pre.style.format("{:.3f}"))
+        st.write("Poids de crédibilité Z")
+        st.dataframe(Z.style.format("{:.2f}"))
+        st.write("Effectifs N")
+        st.dataframe(N)
 
 if _name_ == "_main_":
     main()
