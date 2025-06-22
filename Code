@@ -1,166 +1,101 @@
 import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.express as px
 
-# --- 1. Génération des données synthétiques ---
-@st.cache_data
-def generate_data(n_elr=500, n_tarif=500, n_codes=30):
-    np.random.seed(42)
-    codes = [f"A{i:03d}" for i in range(1, n_codes + 1)]
+# -------- Fonctions de calcul --------
+def allocate_steps(weights, lower, upper, sigma):
+    """
+    Distribution gloutonne d'un total sigma sur des variables bornées,
+    en favorisant celles ayant les plus grands poids.
+    """
+    n = len(weights)
+    allocation = lower.copy().astype(float)
+    remaining = sigma - allocation.sum()
+    # Indices triés par poids décroissant
+    idx_sorted = np.argsort(weights)[::-1]
+    for i in idx_sorted:
+        if remaining <= 0:
+            break
+        cap = upper[i] - lower[i]
+        delta = min(cap, remaining)
+        allocation[i] += delta
+        remaining -= delta
+    return allocation
 
-    # ELR
-    elr = pd.DataFrame({
-        'Code activité': np.random.choice(codes, n_elr),
-        'Pol Formule': np.random.choice(['Atout PRO', 'Autre'], n_elr, p=[0.7, 0.3]),
-        'Libellé': np.random.choice([f'Libelle_{i}' for i in range(1, 11)], n_elr),
-        'Pourcentage ELR': np.round(np.random.uniform(0, 100, n_elr), 2)
-    })
 
-    # Tarif Vendu
-    tarif = pd.DataFrame({
-        'Code_acti_ET100': np.random.choice(codes, n_tarif),
-        'Produit': np.random.choice(['AtoutsPRO', 'ProduitX'], n_tarif, p=[0.7, 0.3]),
-        'FORMULE': np.random.choice([f'Formule_{i}' for i in range(1, 6)], n_tarif),
-        'Nombre_AN24': np.random.randint(1, 100, n_tarif),
-        'Somme_tarif_vendu': np.round(np.random.uniform(1000, 5000, n_tarif), 2),
-        'Somme_tarif_vendu_SansFDR': np.round(np.random.uniform(500, 4500, n_tarif), 2),
-        'moyenne_tarif_vendu_HT': np.round(np.random.uniform(10, 100, n_tarif), 2),
-        'moyenne_tarif_vendu_SansFDR': np.round(np.random.uniform(10, 90, n_tarif), 2)
-    })
-
-    # Activité
-    activite = pd.DataFrame({
-        'CodeActivite_AtoutsPro': codes,
-        'marché_réel': np.random.choice(['Marché1', 'Marché2', 'Marché3'], len(codes))
-    })
-
-    # Taux de Concrétisation
-    taux = pd.DataFrame({
-        'Code': codes,
-        'Taux': np.round(np.random.uniform(0, 100, len(codes)), 2)
-    })
-    return elr, tarif, activite, taux
-
-# --- 2. Préparation et segmentation ---
-@st.cache_data
-def prepare_data(elr, tarif, activite, taux, n_elr_seg=20, n_taux_seg=10):
-    # Filtrer ELR "Atout PRO"
-    elr_f = elr[elr['Pol Formule'] == 'Atout PRO'].rename(columns={'Pourcentage ELR': 'ELR_pct'})
-    # Segmentation ELR
-    bins_elr = np.quantile(elr_f['ELR_pct'], np.linspace(0, 1, n_elr_seg + 1))
-    labels_elr = [f"G{j+1}" for j in range(n_elr_seg)]
-    elr_f['Segment_ELR'] = pd.cut(elr_f['ELR_pct'], bins=bins_elr, labels=labels_elr, include_lowest=True)
-
-    # Filtrer Tarif Vendu "AtoutsPRO"
-    tarif_f = tarif[tarif['Produit'] == 'AtoutsPRO']
-
-    # Fusion ELR + Tarif
-    merged = elr_f.merge(tarif_f, left_on='Code activité', right_on='Code_acti_ET100', how='inner')
-
-    # Enrichir avec marché
-    activite_r = activite.rename(columns={'CodeActivite_AtoutsPro': 'Code activité', 'marché_réel': 'marché'})
-    merged = merged.merge(activite_r, on='Code activité', how='left')
-
-    # Fusion avec taux
-    taux_r = taux.rename(columns={'Code': 'Code activité', 'Taux': 'Taux_pct'})
-    merged = merged.merge(taux_r, on='Code activité', how='left')
-    # Segmentation Taux
-    bins_taux = np.quantile(merged['Taux_pct'], np.linspace(0, 1, n_taux_seg + 1))
-    labels_taux = [f"T{j+1}" for j in range(n_taux_seg)]
-    merged['Segment_Taux'] = pd.cut(merged['Taux_pct'], bins=bins_taux, labels=labels_taux, include_lowest=True)
-
-    return merged
-
-# --- 3. Calcul de la matrice de majoration ---
-@st.cache_data
-def compute_matrix(alpha_min, alpha_max, beta_min, beta_max, sigma, n_taux=10, n_elr=20):
-    alpha_steps = np.linspace(alpha_min, alpha_max, n_taux)
-    beta_steps = np.linspace(beta_min, beta_max, n_elr)
-    M = np.zeros((n_taux, n_elr))
-    for i in range(1, n_taux):
-        M[i, 0] = M[i-1, 0] - alpha_steps[i-1]
-    for i in range(n_taux):
-        for j in range(1, n_elr):
-            M[i, j] = M[i, j-1] - beta_steps[j-1]
-    # Ajuster pour M[-1, -1] = sigma
-    if M[-1, -1] != 0:
-        M *= sigma / M[-1, -1]
+def compute_matrix(alpha, beta):
+    """
+    Construit M selon :
+    M[0,0] = 0
+    M[0,j] = M[0,j-1] + beta[j]
+    M[i,j] = M[i-1,j] + alpha[i]
+    (on indexe alpha et beta à partir de 0)
+    """
+    I = len(alpha)
+    J = len(beta)
+    M = np.zeros((I, J))
+    # première ligne (i=0)
+    for j in range(1, J):
+        M[0, j] = M[0, j-1] + beta[j]
+    # reste
+    for i in range(1, I):
+        for j in range(J):
+            M[i, j] = M[i-1, j] + alpha[i]
     return M
 
-# --- 4. Streamlit App ---
-def main():
-    st.set_page_config(layout="wide")
-    st.title("Analyse Atouts PRO - Version Test avec Données Synthétiques")
+# -------- Interface Streamlit --------
+st.title("Matrice de Majoration")
 
-    # Générer et préparer les data
-    elr, tarif, activite, taux = generate_data()
-    df = prepare_data(elr, tarif, activite, taux)
+# Entrée utilisateur pour le coef maximal σ
+sigma = st.number_input("Coefficient maximal σ (M₁₀,₂₀)", min_value=0.0, value=100.0)
 
-    # Affichage du tableau complet
-    st.header("Vue d'ensemble des données fusionnées")
-    st.dataframe(df)
+# Poids par défaut (plus le segment est élevé, plus on veut majorer)
+alpha_weights = np.arange(1, 11)  # pour 10 segments de concrétisation
+beta_weights  = np.arange(1, 21)  # pour 20 segments ELR
 
-    # Indicateurs clés
-    st.subheader("Indicateurs clés")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Activités uniques", df['Code activité'].nunique())
-    c2.metric("Moyenne ELR (%)", f"{df['ELR_pct'].mean():.1f}")
-    c3.metric("Moyenne Taux (%)", f"{df['Taux_pct'].mean():.1f}")
-    c4.metric("CA total", f"{df['Somme_tarif_vendu'].sum():.0f}")
+# Bornes globales ajustables via la sidebar
+st.sidebar.header("Bornes pour α et β")
+min_alpha = st.sidebar.number_input("Min α_i", min_value=0.0, value=0.0)
+max_alpha = st.sidebar.number_input("Max α_i", min_value=0.0, value=sigma)
+min_beta  = st.sidebar.number_input("Min β_j", min_value=0.0, value=0.0)
+max_beta  = st.sidebar.number_input("Max β_j", min_value=0.0, value=sigma)
 
-    # Distributions
-    st.subheader("Distributions des indicateurs")
-    hist1 = px.histogram(df, x='ELR_pct', nbins=20, title="Distribution ELR")
-    hist2 = px.histogram(df, x='Taux_pct', nbins=20, title="Distribution Taux")
-    st.plotly_chart(hist1, use_container_width=True)
-    st.plotly_chart(hist2, use_container_width=True)
+# Construction des vecteurs de bornes
+lower_alpha = np.full(10, min_alpha)
+upper_alpha = np.full(10, max_alpha)
+lower_beta  = np.full(20, min_beta)
+upper_beta  = np.full(20, max_beta)
 
-    # Corrélation et scatter
-    st.subheader("Corrélation et nuage de points")
-    corr = df[['ELR_pct', 'Taux_pct', 'Somme_tarif_vendu']].corr()
-    heat = px.imshow(corr, text_auto=True, title="Matrice de Corrélation")
-    scatter = px.scatter(df, x='ELR_pct', y='Taux_pct', size='Somme_tarif_vendu', color='Segment_ELR', title="ELR vs Taux (taille=CA)")
-    st.plotly_chart(heat, use_container_width=True)
-    st.plotly_chart(scatter, use_container_width=True)
+# Calcul des pas α et β
+alpha = allocate_steps(alpha_weights, lower_alpha, upper_alpha, sigma)
+beta  = allocate_steps(beta_weights,  lower_beta,  upper_beta,  sigma)
 
-    # Analyse par segment
-    st.subheader("Analyse par segment ELR")
-    bar_seg = df.groupby('Segment_ELR')['Somme_tarif_vendu'].mean().reset_index()
-    fig_bar = px.bar(bar_seg, x='Segment_ELR', y='Somme_tarif_vendu', title="CA moyen par segment ELR")
-    st.plotly_chart(fig_bar, use_container_width=True)
+# Construction de la matrice M
+M = compute_matrix(alpha, beta)
 
-    st.subheader("Analyse par segment Taux")
-    bar_taux = df.groupby('Segment_Taux')['Somme_tarif_vendu'].mean().reset_index()
-    fig_bar2 = px.bar(bar_taux, x='Segment_Taux', y='Somme_tarif_vendu', title="CA moyen par segment Taux")
-    st.plotly_chart(fig_bar2, use_container_width=True)
+# Affichage sous forme de DataFrame
+df = pd.DataFrame(
+    M,
+    index=[f"i={i+1}" for i in range(M.shape[0])],
+    columns=[f"j={j+1}" for j in range(M.shape[1])]
+)
+st.subheader("Matrice des coefficients M_{i,j}")
+st.dataframe(df)
 
-    # Filtre par code activité
-    st.sidebar.header("Filtrer par code activité")
-    codes_sel = st.sidebar.multiselect("Sélectionnez des codes", df['Code activité'].unique())
-    if codes_sel:
-        df_sel = df[df['Code activité'].isin(codes_sel)]
-        st.subheader(f"Vue filtrée pour {len(codes_sel)} code(s)")
-        st.dataframe(df_sel)
-        fig_box = px.box(df_sel, x='Segment_ELR', y='Somme_tarif_vendu', color='Segment_Taux', title="Boxplot CA par segment pour sélection")
-        st.plotly_chart(fig_box, use_container_width=True)
+# Affichage heatmap interactif
+fig = px.imshow(
+    M,
+    labels={"x": "ELR segments (j)", "y": "Concrétisation segments (i)", "color": "M"},
+    x=df.columns,
+    y=df.index,
+    aspect="auto"
+)
+st.subheader("Heatmap de la matrice")
+st.plotly_chart(fig)
 
-    # Matrice de majoration
-    st.header("Matrice de Majoration")
-    col_a, col_b, col_c = st.columns(3)
-    sigma = col_a.number_input("Valeur σ (M_{10,20})", value=100.0)
-    alpha_min, alpha_max = col_b.slider("α min/max", 0.0, 50.0, (5.0, 15.0), step=0.5)
-    beta_min, beta_max = col_c.slider("β min/max", 0.0, 50.0, (5.0, 15.0), step=0.5)
-
-    M = compute_matrix(alpha_min, alpha_max, beta_min, beta_max, sigma)
-    st.subheader("Tableau des coefficients")
-    df_M = pd.DataFrame(M, index=[f"T{i+1}" for i in range(M.shape[0])], columns=[f"G{j+1}" for j in range(M.shape[1])])
-    st.dataframe(df_M)
-
-    st.subheader("Heatmap de la matrice")
-    fig_heat = px.imshow(M, aspect='auto', title="Heatmap Majoration", labels={'x':'ELR','y':'Taux'})
-    st.plotly_chart(fig_heat, use_container_width=True)
-
-if _name_ == '_main_':
-    main()
-4
+# Affichage des vecteurs α et β
+st.sidebar.subheader("Pas calculés α_i")
+st.sidebar.write(alpha)
+st.sidebar.subheader("Pas calculés β_j")
+st.sidebar.write(beta)
