@@ -2,537 +2,150 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import seaborn as sns
-import matplotlib.pyplot as plt
-from scipy.stats import pearsonr
-from io import BytesIO
 
-# Configuration de la page
-st.set_page_config(
-    page_title="Analyse des Atouts PRO",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Titre principal
-st.title("📊 Analyse des Atouts PRO")
-st.markdown("---")
-
-# Fonctions utilitaires
+# 1. Data Loading and Preparation
 @st.cache_data
-def create_sample_data():
-    """Créer des données d'exemple pour démonstration"""
-    np.random.seed(42)
-    
-    # Génération des codes activité
-    codes_activite = [f"ACT{i:03d}" for i in range(1, 101)]
-    
-    # Data ELR
-    elr_data = pd.DataFrame({
-        'Code activité': codes_activite,
-        'Pol Formule': ['Atout PRO'] * 100,
-        'Libellé': [f'Activité {i}' for i in range(1, 101)],
-        'Pourcentage ELR': np.random.uniform(5, 25, 100)
-    })
-    
-    # Data Tarif Vendu
-    tarif_data = pd.DataFrame({
-        'Code_acti_ET100': codes_activite,
-        'Produit': ['AtoutsPRO'] * 100,
-        'FORMULE': ['Atout PRO'] * 100,
-        'Nombre_AN24': np.random.randint(10, 500, 100),
-        'Somme_tarif_vendu': np.random.uniform(50000, 2000000, 100),
-        'Somme_tarif_vendu_SansFDR': lambda x: x * 0.95,
-        'moyenne_tarif_vendu_HT': np.random.uniform(1000, 15000, 100),
-        'moyenne_tarif_vendu_SansFDR': lambda x: x * 0.95
-    })
-    
-    # Calcul des colonnes dérivées
-    tarif_data['Somme_tarif_vendu_SansFDR'] = tarif_data['Somme_tarif_vendu'] * 0.95
-    tarif_data['moyenne_tarif_vendu_SansFDR'] = tarif_data['moyenne_tarif_vendu_HT'] * 0.95
-    
-    # Data marché
-    marche_data = pd.DataFrame({
-        'CodeActivite_AtoutsPro': codes_activite,
-        'marché_réel': np.random.choice(['Automobile', 'Habitation', 'Professionnel', 'Santé', 'Loisirs'], 100)
-    })
-    
-    # Taux de concrétisation
-    taux_data = pd.DataFrame({
-        'Code': codes_activite,
-        'Taux_Concretisation': np.random.uniform(0.15, 0.85, 100)
-    })
-    
-    return elr_data, tarif_data, marche_data, taux_data
+def load_data(elr_path, tarif_path, activite_path, taux_path):
+    elr = pd.read_csv(elr_path)
+    tarif = pd.read_csv(tarif_path)
+    activite = pd.read_csv(activite_path)
+    taux = pd.read_csv(taux_path)
+    return elr, tarif, activite, taux
 
-def create_segments(data, column, n_segments, prefix):
-    """Créer des segments basés sur les quantiles"""
-    quantiles = np.linspace(0, 1, n_segments + 1)
-    segment_bounds = data[column].quantile(quantiles).values
-    
-    segments = []
-    for i in range(n_segments):
-        segments.append({
-            'Groupe': f'{prefix}_{i+1:02d}',
-            'Min': segment_bounds[i],
-            'Max': segment_bounds[i+1]
-        })
-    
-    return pd.DataFrame(segments)
+# 2. Filtering and Segmentation
+@st.cache_data
+def segment_elr(elr_df, n_segments=20):
+    elr_filtered = elr_df[elr_df['Pol Formule'] == 'Atout PRO'].copy()
+    elr_filtered = elr_filtered.rename(columns={'Pourcentage ELR':'ELR_pct'})
+    bins = np.quantile(elr_filtered['ELR_pct'], np.linspace(0,1,n_segments+1))
+    labels = [f"G{idx+1}" for idx in range(n_segments)]
+    elr_filtered['Segment_ELR'] = pd.cut(elr_filtered['ELR_pct'], bins=bins, labels=labels, include_lowest=True)
+    # Build segment table
+    seg = elr_filtered.groupby('Segment_ELR')['ELR_pct'].agg(['min','max']).reset_index()
+    seg.columns = ['Groupe','Min Pourcentage','Max Pourcentage']
+    return elr_filtered, seg
 
-def assign_segment(value, segments_df, min_col='Min', max_col='Max'):
-    """Assigner un segment à une valeur"""
-    for _, segment in segments_df.iterrows():
-        if segment[min_col] <= value <= segment[max_col]:
-            return segment['Groupe']
-    return segments_df.iloc[-1]['Groupe']  # Dernier segment par défaut
+@st.cache_data
+def filter_tarif(tarif_df):
+    tarif_filtered = tarif_df[tarif_df['Produit'] == 'AtoutsPRO'].copy()
+    return tarif_filtered
 
-def prepare_data():
-    """Préparer toutes les données selon le cahier des charges"""
-    elr_data, tarif_data, marche_data, taux_data = create_sample_data()
-    
-    # 1. Filtrage ELR pour "Atout PRO"
-    elr_atouts_pro = elr_data[elr_data['Pol Formule'] == 'Atout PRO'].copy()
-    
-    # 2. Créer des segments ELR (20 groupes)
-    segment_elr = create_segments(elr_atouts_pro, 'Pourcentage ELR', 20, 'ELR')
-    
-    # 3. Filtrer Tarif Vendu pour "AtoutsPRO"
-    tarif_atoutspro = tarif_data[tarif_data['Produit'] == 'AtoutsPRO'].copy()
-    
-    # 4. Fusion ELR + Tarif Vendu
-    data_all = pd.merge(
-        elr_atouts_pro,
-        tarif_atoutspro,
-        left_on='Code activité',
-        right_on='Code_acti_ET100',
-        how='inner'
-    )
-    
-    # 5. Enrichissement avec marché
-    data_all = pd.merge(
-        data_all,
-        marche_data,
-        left_on='Code activité',
-        right_on='CodeActivite_AtoutsPro',
-        how='left'
-    )
-    data_all.rename(columns={'marché_réel': 'marché'}, inplace=True)
-    
-    # 6. Fusion avec taux de concrétisation
-    data_all_fusione = pd.merge(
-        data_all,
-        taux_data,
-        left_on='Code activité',
-        right_on='Code',
-        how='left'
-    )
-    
-    # 7. Créer des segments de taux de concrétisation (10 groupes)
-    segment_taux = create_segments(data_all_fusione, 'Taux_Concretisation', 10, 'TAUX')
-    
-    # 8. Assigner les segments aux données
-    data_all_fusione['Segment_ELR'] = data_all_fusione['Pourcentage ELR'].apply(
-        lambda x: assign_segment(x, segment_elr)
-    )
-    data_all_fusione['Segment_Taux'] = data_all_fusione['Taux_Concretisation'].apply(
-        lambda x: assign_segment(x, segment_taux)
-    )
-    
-    return data_all_fusione, segment_elr, segment_taux
+# 3. Merge ELR and Tarif
+@st.cache_data
+def merge_elr_tarif(elr_df, tarif_df):
+    merged = elr_df.merge(tarif_df, left_on='Code activité', right_on='Code_acti_ET100', how='inner')
+    return merged
 
-def calculate_kpis(df):
-    """Calculer les indicateurs clés"""
-    kpis = {
-        'Total_AN24': df['Nombre_AN24'].sum(),
-        'Taux_Concretisation_Global': df['Taux_Concretisation'].mean(),
-        'Total_Tarif_Vendu': df['Somme_tarif_vendu'].sum(),
-        'Total_Tarif_Vendu_SansFDR': df['Somme_tarif_vendu_SansFDR'].sum(),
-        'Nb_Activites': df['Code activité'].nunique()
-    }
-    return kpis
+# 4. Enrich with 'marché'
+@st.cache_data
+def enrich_marche(df, activite_df):
+    a = activite_df.rename(columns={'CodeActivite_AtoutsPro':'Code activité','marché_réel':'marché'})
+    enriched = df.merge(a[['Code activité','marché']], on='Code activité', how='left')
+    return enriched
 
-def create_majoration_matrix(segment_elr, segment_taux, sigma, alpha_range, beta_range):
-    """Créer la matrice de majoration"""
-    n_taux = len(segment_taux)  # 10
-    n_elr = len(segment_elr)    # 20
-    
-    # Initialiser la matrice
-    matrix = np.zeros((n_taux, n_elr))
-    
-    # Calculer les pas alpha et beta
-    alpha_total = sigma * 0.6  # 60% de la variation pour les taux
-    beta_total = sigma * 0.4   # 40% de la variation pour ELR
-    
-    # Distribution des pas (plus important pour les segments à risque)
-    alphas = np.linspace(alpha_total/n_taux * 0.5, alpha_total/n_taux * 1.5, n_taux-1)
-    betas = np.linspace(beta_total/n_elr * 0.5, beta_total/n_elr * 1.5, n_elr-1)
-    
-    # Remplir la matrice
-    matrix[0, 0] = sigma  # M_{1,1} = sigma
-    
-    # Remplir la première ligne
-    for j in range(1, n_elr):
-        matrix[0, j] = max(0.1, matrix[0, j-1] - betas[j-1])
-    
-    # Remplir la première colonne
-    for i in range(1, n_taux):
-        matrix[i, 0] = max(0.1, matrix[i-1, 0] - alphas[i-1])
-    
-    # Remplir le reste de la matrice
-    for i in range(1, n_taux):
-        for j in range(1, n_elr):
-            matrix[i, j] = max(0.1, (matrix[i-1, j] + matrix[i, j-1]) / 2 - (alphas[i-1] + betas[j-1]) / 4)
-    
-    return matrix
+# 5. Merge with taux concrétisation and segment
+@st.cache_data
+def merge_taux(df, taux_df, n_segments=10):
+    merged = df.merge(taux_df.rename(columns={'Code':'Code activité'}), on='Code activité', how='left')
+    merged = merged.rename(columns={'Taux':'Taux_pct'})
+    # Segment taux
+    bins = np.quantile(merged['Taux_pct'], np.linspace(0,1,n_segments+1))
+    labels = [f"T{idx+1}" for idx in range(n_segments)]
+    merged['Segment_Taux'] = pd.cut(merged['Taux_pct'], bins=bins, labels=labels, include_lowest=True)
+    seg = merged.groupby('Segment_Taux')['Taux_pct'].agg(['min','max']).reset_index()
+    seg.columns = ['Groupe','Min Pourcentage','Max Pourcentage']
+    return merged, seg
 
-# Interface utilisateur
+# 6. Matrix of Majorations
+@st.cache_data
+def compute_matrix(alpha_steps, beta_steps, sigma):
+    rows = len(alpha_steps)
+    cols = len(beta_steps)
+    M = np.zeros((rows, cols))
+    # fill first cell
+    M[0,0] = 0
+    # fill first column
+    for i in range(1, rows):
+        M[i,0] = M[i-1,0] - alpha_steps[i-1]
+    # fill remaining
+    for i in range(rows):
+        for j in range(1, cols):
+            M[i,j] = M[i,j-1] - beta_steps[j-1]
+    # adjust scale to satisfy M[-1,-1] = sigma
+    current = M[-1,-1]
+    factor = sigma / current if current != 0 else 1.0
+    M = M * factor
+    return M
+
+# ---- Streamlit App ----
 def main():
-    # Sidebar pour les paramètres
-    st.sidebar.header("⚙️ Paramètres")
-    
-    # Chargement des données
-    with st.spinner("Chargement des données..."):
-        data_all_fusione, segment_elr, segment_taux = prepare_data()
-    
-    # Onglets principaux
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📈 Analyse Globale", 
-        "🔗 Corrélations", 
-        "🎯 Filtrage par Activité", 
-        "📋 Matrice de Majoration"
-    ])
-    
-    # TAB 1: Analyse Globale
-    with tab1:
-        st.header("📊 Vue d'ensemble des données")
-        
-        # KPIs
-        kpis = calculate_kpis(data_all_fusione)
-        
-        col1, col2, col3, col4, col5 = st.columns(5)
-        
-        with col1:
-            st.metric(
-                "Total AN24",
-                f"{kpis['Total_AN24']:,}",
-                help="Nombre total d'affaires nouvelles"
-            )
-        
-        with col2:
-            st.metric(
-                "Taux Concrétisation Global",
-                f"{kpis['Taux_Concretisation_Global']:.1%}",
-                help="Ratio entre affaires conclues et totales"
-            )
-        
-        with col3:
-            st.metric(
-                "CA Total",
-                f"€{kpis['Total_Tarif_Vendu']:,.0f}",
-                help="Chiffre d'affaires total"
-            )
-        
-        with col4:
-            st.metric(
-                "CA sans FDR",
-                f"€{kpis['Total_Tarif_Vendu_SansFDR']:,.0f}",
-                help="Chiffre d'affaires hors frais de dossier"
-            )
-        
-        with col5:
-            st.metric(
-                "Nb Activités",
-                f"{kpis['Nb_Activites']}",
-                help="Nombre d'activités différentes"
-            )
-        
-        st.markdown("---")
-        
-        # Graphiques
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Répartition par marché
-            marche_data = data_all_fusione.groupby('marché').agg({
-                'Nombre_AN24': 'sum',
-                'Somme_tarif_vendu': 'sum'
-            }).reset_index()
-            
-            fig_marche = px.pie(
-                marche_data, 
-                values='Nombre_AN24', 
-                names='marché',
-                title="Répartition des AN24 par Marché"
-            )
-            st.plotly_chart(fig_marche, use_container_width=True)
-        
-        with col2:
-            # Top 10 activités
-            top_activites = data_all_fusione.nlargest(10, 'Nombre_AN24')[
-                ['Code activité', 'Nombre_AN24', 'Libellé']
-            ]
-            
-            fig_top = px.bar(
-                top_activites,
-                x='Nombre_AN24',
-                y='Code activité',
-                orientation='h',
-                title="Top 10 Activités par AN24"
-            )
-            fig_top.update_layout(yaxis={'categoryorder': 'total ascending'})
-            st.plotly_chart(fig_top, use_container_width=True)
-        
-        # Distribution des indicateurs
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig_elr = px.histogram(
-                data_all_fusione,
-                x='Pourcentage ELR',
-                nbins=30,
-                title="Distribution des Pourcentages ELR"
-            )
-            st.plotly_chart(fig_elr, use_container_width=True)
-        
-        with col2:
-            fig_taux = px.histogram(
-                data_all_fusione,
-                x='Taux_Concretisation',
-                nbins=30,
-                title="Distribution des Taux de Concrétisation"
-            )
-            st.plotly_chart(fig_taux, use_container_width=True)
-        
-        # Tableau des données
-        st.subheader("📋 Données détaillées")
-        st.dataframe(
-            data_all_fusione[[
-                'Code activité', 'Libellé', 'marché', 'Pourcentage ELR',
-                'Taux_Concretisation', 'Nombre_AN24', 'Somme_tarif_vendu'
-            ]].round(2),
-            use_container_width=True
-        )
-    
-    # TAB 2: Corrélations
-    with tab2:
-        st.header("🔗 Analyse de Corrélation ELR vs Taux de Concrétisation")
-        
-        # Calcul de la corrélation
-        corr_coef, p_value = pearsonr(
-            data_all_fusione['Pourcentage ELR'],
-            data_all_fusione['Taux_Concretisation']
-        )
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Coefficient de Corrélation", f"{corr_coef:.3f}")
-        with col2:
-            st.metric("P-value", f"{p_value:.3f}")
-        with col3:
-            interpretation = "Forte" if abs(corr_coef) > 0.7 else "Modérée" if abs(corr_coef) > 0.3 else "Faible"
-            st.metric("Interprétation", interpretation)
-        
-        # Scatter plot avec ligne de tendance
-        fig_scatter = px.scatter(
-            data_all_fusione,
-            x='Pourcentage ELR',
-            y='Taux_Concretisation',
-            size='Nombre_AN24',
-            color='marché',
-            trendline='ols',
-            title=f"Corrélation ELR vs Taux de Concrétisation (r={corr_coef:.3f})",
-            labels={
-                'Pourcentage ELR': 'Pourcentage ELR (%)',
-                'Taux_Concretisation': 'Taux de Concrétisation'
-            }
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-        
-        # Heatmap de corrélation
-        correlation_vars = [
-            'Pourcentage ELR', 'Taux_Concretisation', 'Nombre_AN24',
-            'Somme_tarif_vendu', 'moyenne_tarif_vendu_HT'
-        ]
-        
-        corr_matrix = data_all_fusione[correlation_vars].corr()
-        
-        fig_heatmap = px.imshow(
-            corr_matrix,
-            text_auto=True,
-            aspect="auto",
-            title="Matrice de Corrélation",
-            color_continuous_scale='RdBu_r'
-        )
-        st.plotly_chart(fig_heatmap, use_container_width=True)
-    
-    # TAB 3: Filtrage par Activité
-    with tab3:
-        st.header("🎯 Analyse par Code d'Activité")
-        
-        # Sélecteur d'activités
-        selected_activities = st.multiselect(
-            "Sélectionner les codes d'activité à analyser:",
-            options=data_all_fusione['Code activité'].unique(),
-            default=data_all_fusione['Code activité'].unique()[:5]
-        )
-        
-        if selected_activities:
-            filtered_data = data_all_fusione[
-                data_all_fusione['Code activité'].isin(selected_activities)
-            ]
-            
-            # KPIs filtrés
-            filtered_kpis = calculate_kpis(filtered_data)
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total AN24 (filtrés)", f"{filtered_kpis['Total_AN24']:,}")
-            with col2:
-                st.metric("Taux Concrétisation Moyen", f"{filtered_kpis['Taux_Concretisation_Global']:.1%}")
-            with col3:
-                st.metric("CA Total (filtrés)", f"€{filtered_kpis['Total_Tarif_Vendu']:,.0f}")
-            
-            # Comparaison des activités sélectionnées
-            comparison_data = filtered_data.groupby('Code activité').agg({
-                'Nombre_AN24': 'sum',
-                'Pourcentage ELR': 'mean',
-                'Taux_Concretisation': 'mean',
-                'Somme_tarif_vendu': 'sum'
-            }).reset_index()
-            
-            fig_comparison = make_subplots(
-                rows=2, cols=2,
-                subplot_titles=('AN24 par Activité', 'ELR Moyen', 'Taux de Concrétisation', 'CA par Activité'),
-                specs=[[{"secondary_y": False}, {"secondary_y": False}],
-                       [{"secondary_y": False}, {"secondary_y": False}]]
-            )
-            
-            # AN24
-            fig_comparison.add_trace(
-                go.Bar(x=comparison_data['Code activité'], 
-                      y=comparison_data['Nombre_AN24'], 
-                      name='AN24'),
-                row=1, col=1
-            )
-            
-            # ELR
-            fig_comparison.add_trace(
-                go.Bar(x=comparison_data['Code activité'], 
-                      y=comparison_data['Pourcentage ELR'], 
-                      name='ELR %'),
-                row=1, col=2
-            )
-            
-            # Taux
-            fig_comparison.add_trace(
-                go.Bar(x=comparison_data['Code activité'], 
-                      y=comparison_data['Taux_Concretisation'], 
-                      name='Taux'),
-                row=2, col=1
-            )
-            
-            # CA
-            fig_comparison.add_trace(
-                go.Bar(x=comparison_data['Code activité'], 
-                      y=comparison_data['Somme_tarif_vendu'], 
-                      name='CA'),
-                row=2, col=2
-            )
-            
-            fig_comparison.update_layout(height=600, showlegend=False, title_text="Comparaison des Activités Sélectionnées")
-            st.plotly_chart(fig_comparison, use_container_width=True)
-            
-            # Tableau détaillé
-            st.subheader("Détails des activités sélectionnées")
-            st.dataframe(comparison_data.round(2), use_container_width=True)
-    
-    # TAB 4: Matrice de Majoration
-    with tab4:
-        st.header("📋 Matrice de Majoration")
-        
-        # Paramètres de la matrice
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            sigma = st.slider(
-                "Valeur maximale σ (M₁,₁)",
-                min_value=1.0,
-                max_value=5.0,
-                value=2.5,
-                step=0.1,
-                help="Coefficient maximum de majoration"
-            )
-        
-        with col2:
-            st.write("**Paramètres des segments:**")
-            st.write(f"• Segments ELR: {len(segment_elr)}")
-            st.write(f"• Segments Taux: {len(segment_taux)}")
-            st.write(f"• Taille matrice: {len(segment_taux)} × {len(segment_elr)}")
-        
-        # Calcul de la matrice
-        alpha_range = (0.1, 0.3)
-        beta_range = (0.05, 0.2)
-        
-        matrix = create_majoration_matrix(segment_elr, segment_taux, sigma, alpha_range, beta_range)
-        
-        # Visualisation de la matrice
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            # Heatmap de la matrice
-            fig_matrix = px.imshow(
-                matrix,
-                labels=dict(x="Segments ELR", y="Segments Taux", color="Coefficient"),
-                x=[f"ELR_{i+1:02d}" for i in range(len(segment_elr))],
-                y=[f"TAUX_{i+1:02d}" for i in range(len(segment_taux))],
-                color_continuous_scale='RdYlBu_r',
-                title="Matrice de Majoration"
-            )
-            fig_matrix.update_layout(height=600)
-            st.plotly_chart(fig_matrix, use_container_width=True)
-        
-        with col2:
-            st.subheader("Statistiques de la matrice")
-            st.metric("Coefficient minimum", f"{matrix.min():.3f}")
-            st.metric("Coefficient maximum", f"{matrix.max():.3f}")
-            st.metric("Coefficient moyen", f"{matrix.mean():.3f}")
-            st.metric("Écart-type", f"{matrix.std():.3f}")
-            
-            # Affichage des segments critiques
-            st.subheader("Zones critiques")
-            max_pos = np.unravel_index(matrix.argmax(), matrix.shape)
-            min_pos = np.unravel_index(matrix.argmin(), matrix.shape)
-            
-            st.write(f"**Maximum:** TAUX_{max_pos[0]+1:02d} × ELR_{max_pos[1]+1:02d}")
-            st.write(f"Coefficient: {matrix[max_pos]:.3f}")
-            
-            st.write(f"**Minimum:** TAUX_{min_pos[0]+1:02d} × ELR_{min_pos[1]+1:02d}")
-            st.write(f"Coefficient: {matrix[min_pos]:.3f}")
-        
-        # Tableau de la matrice
-        st.subheader("Matrice détaillée")
-        
-        matrix_df = pd.DataFrame(
-            matrix,
-            columns=[f"ELR_{i+1:02d}" for i in range(len(segment_elr))],
-            index=[f"TAUX_{i+1:02d}" for i in range(len(segment_taux))]
-        )
-        
-        st.dataframe(matrix_df.round(3), use_container_width=True)
-        
-        # Export de la matrice
-        if st.button("📥 Télécharger la matrice"):
-            csv = matrix_df.to_csv()
-            st.download_button(
-                label="Télécharger CSV",
-                data=csv,
-                file_name=f"matrice_majoration_sigma_{sigma}.csv",
-                mime="text/csv"
-            )
+    st.title("Analyse Atouts PRO")
+    # Sidebar: file inputs
+    st.sidebar.header("Chargement des données")
+    elr_file = st.sidebar.file_uploader("ELR CSV", type=['csv'])
+    tarif_file = st.sidebar.file_uploader("Tarif Vendu CSV", type=['csv'])
+    activite_file = st.sidebar.file_uploader("Activité CSV", type=['csv'])
+    taux_file = st.sidebar.file_uploader("Taux Concrétisation CSV", type=['csv'])
 
-if __name__ == "__main__":
+    if elr_file and tarif_file and activite_file and taux_file:
+        elr, tarif, activite, taux = load_data(elr_file, tarif_file, activite_file, taux_file)
+        # Processing
+        elr_seg, seg_elr = segment_elr(elr)
+        tarif_f = filter_tarif(tarif)
+        data_all = merge_elr_tarif(elr_seg, tarif_f)
+        data_all = enrich_marche(data_all, activite)
+        data_all_fus, seg_taux = merge_taux(data_all, taux)
+
+        # Display raw data
+        st.header("Données Fusionnées Completes")
+        st.dataframe(data_all_fus)
+
+        # Key indicators
+        st.markdown("### Indicateurs Clés")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Activités", data_all_fus['Code activité'].nunique())
+        col2.metric("Moyenne ELR", f"{data_all_fus['ELR_pct'].mean():.2f}%")
+        col3.metric("Moyenne Taux Concrétisation", f"{data_all_fus['Taux_pct'].mean():.2f}%")
+
+        # Interactive visualizations
+        st.header("Visualisations Interactives")
+        # Volume par code activité
+        fig1 = px.bar(data_all_fus.groupby('Code activité').size().reset_index(name='Count'), x='Code activité', y='Count')
+        st.plotly_chart(fig1)
+
+        # Corrélations
+        st.subheader("Corrélation des Indicateurs")
+        corr = data_all_fus[['ELR_pct','Taux_pct','Somme_tarif_vendu']].corr()
+        fig2 = px.imshow(corr, text_auto=True)
+        st.plotly_chart(fig2)
+
+        # Segment analysis
+        st.header("Analyse par Segment")
+        selected = st.multiselect("Sélectionner Code Activité", data_all_fus['Code activité'].unique())
+        if selected:
+            df_sel = data_all_fus[data_all_fus['Code activité'].isin(selected)]
+            fig3 = px.box(df_sel, x='Segment_ELR', y='Somme_tarif_vendu', points='all')
+            st.plotly_chart(fig3)
+
+        # Matrice de Majoration
+        st.header("Matrice de Majoration")
+        sigma = st.number_input("Valeur sigma (M_{10,20})", value=100.0)
+        # Get step input ranges
+        st.subheader("Intervalle des Pas alpha (Taux)")
+        alpha_min, alpha_max = st.slider("Alpha min/max", 0.0, 50.0, (5.0,10.0), step=0.5)
+        st.subheader("Intervalle des Pas beta (ELR)")
+        beta_min, beta_max = st.slider("Beta min/max", 0.0, 50.0, (5.0,10.0), step=0.5)
+        # Distribute steps evenly
+        alpha_steps = np.linspace(alpha_min, alpha_max, 10)
+        beta_steps = np.linspace(beta_min, beta_max, 20)
+        M = compute_matrix(alpha_steps, beta_steps, sigma)
+        st.write("Matrice (20x10):")
+        st.dataframe(pd.DataFrame(M, index=[f"T{i+1}" for i in range(10)],
+                                  columns=[f"G{j+1}" for j in range(20)]))
+        # Heatmap
+        st.subheader("Heatmap de la Matrice")
+        fig4 = px.imshow(M, aspect="auto", labels={'x':'ELR Segment','y':'Taux Segment'})
+        st.plotly_chart(fig4)
+
+if _name_ == '_main_':
     main()
