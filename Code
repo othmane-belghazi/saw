@@ -1,53 +1,98 @@
+import streamlit as st
+import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
-from mpl_toolkits.mplot3d import Axes3D
+# Optional: use Plotly for interactive charts
+import plotly.express as px
 
-# Paramètres fixes
-coef_max = 0.7
-rows, cols = 10, 20
-i_vals = np.arange(1, rows + 1)
-j_vals = np.arange(1, cols + 1)
-i_grid, j_grid = np.meshgrid(i_vals, j_vals, indexing='ij')
+# Assume the user has placed their data in a CSV file named 'data.csv'
+@st.cache_data
+def load_data(path='data.csv'):
+    df = pd.read_csv(path)
+    # Standardize column names if needed
+    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+    return df
 
-# Création de la figure interactive
-fig = plt.figure(figsize=(12, 7))
-ax = fig.add_subplot(111, projection='3d')
-plt.subplots_adjust(bottom=0.25)
+def main():
+    st.title("Analyse Métier et Statistique - Atout Pro")
 
-# Fonction de calcul
-def compute_C(alpha, beta):
-    return coef_max * (i_grid / 10)*alpha * (j_grid / 20)*beta
+    # Sidebar: Produit Atout Pro
+    df = load_data()
+    produits = df['libelle_de_activite'].unique()
+    produit_sel = st.sidebar.selectbox("Produit Atout Pro", produits)
 
-# Valeurs initiales
-alpha0 = 0.6
-beta0 = 1.0
-C = compute_C(alpha0, beta0)
-surf = ax.plot_surface(i_grid, j_grid, C, cmap='viridis')
-ax.set_xlabel('Conversion Group (i)')
-ax.set_ylabel('ELR Group (j)')
-ax.set_zlabel('C(i,j)')
-ax.set_title('Effet de alpha et beta sur C(i,j)')
+    # Filtrer les données sur le produit sélectionné
+    df_prod = df[df['libelle_de_activite'] == produit_sel]
 
-# Ajout des sliders
-ax_alpha = plt.axes([0.15, 0.1, 0.65, 0.03])
-ax_beta = plt.axes([0.15, 0.05, 0.65, 0.03])
-slider_alpha = Slider(ax_alpha, 'Alpha (Conversion)', 0.1, 2.0, valinit=alpha0)
-slider_beta = Slider(ax_beta, 'Beta (ELR)', 0.1, 2.0, valinit=beta0)
+    # Affichage des données
+    st.subheader("Données brutes pour le produit sélectionné")
+    st.dataframe(df_prod)
 
-# Fonction de mise à jour
-def update(val):
-    ax.clear()
-    alpha = slider_alpha.val
-    beta = slider_beta.val
-    C = compute_C(alpha, beta)
-    ax.plot_surface(i_grid, j_grid, C, cmap='viridis')
-    ax.set_xlabel('Conversion Group (i)')
-    ax.set_ylabel('ELR Group (j)')
-    ax.set_zlabel('C(i,j)')
-    ax.set_title(f'Surface C(i,j) – alpha={alpha:.2f}, beta={beta:.2f}')
-    fig.canvas.draw_idle()
+    # Statistiques descriptives
+    st.subheader("Statistiques descriptives")
+    st.write(df_prod.describe(include='all'))
 
-slider_alpha.on_changed(update)
-slider_beta.on_changed(update)
+    # Calculs métier clés
+    total_contrats = df_prod['nombre_de_contrat'].sum()
+    total_tarif_sans_frais = df_prod['somme_tarif_sans_frais'].sum()
+    total_tarif_avec_frais = df_prod['somme_tarif_avec_frais'].sum()
+    avg_taux_concr = df_prod['taux_de_concretisation'].mean()
 
-plt.show()
+    st.metric("Total contrats", total_contrats)
+    st.metric("Total tarif sans frais", f"{total_tarif_sans_frais:,.2f}")
+    st.metric("Total tarif avec frais", f"{total_tarif_avec_frais:,.2f}")
+    st.metric("Taux moyen de concrétisation", f"{avg_taux_concr:.2%}")
+
+    # Visualisations
+    st.subheader("Visualisations")
+
+    # Histogramme de l'ELR
+    fig_elr = px.histogram(df_prod, x='elr', nbins=20, title='Distribution de l\'ELR')
+    st.plotly_chart(fig_elr, use_container_width=True)
+
+    # Bar chart: nombre de contrats par segmentation ELR
+    fig_seg = px.bar(
+        df_prod.groupby('segemment_elr')['nombre_de_contrat'].sum().reset_index(),
+        x='segemment_elr', y='nombre_de_contrat',
+        title="Nombre de contrats par segmentation ELR"
+    )
+    st.plotly_chart(fig_seg, use_container_width=True)
+
+    # Scatter: Tarif avec frais vs Taux de concrétisation
+    fig_scatter = px.scatter(
+        df_prod,
+        x='somme_tarif_avec_frais',
+        y='taux_de_concretisation',
+        trendline='ols',
+        title="Tarif avec frais vs Taux de concrétisation"
+    )
+    st.plotly_chart(fig_scatter, use_container_width=True)
+
+    # Matrice de corrélation
+    st.subheader("Matrice de corrélation")
+    corr = df_prod.select_dtypes(include='number').corr()
+    fig_corr, ax_corr = plt.subplots()
+    cax = ax_corr.matshow(corr)
+    fig_corr.colorbar(cax)
+    ax_corr.set_xticks(range(len(corr.columns)))
+    ax_corr.set_yticks(range(len(corr.columns)))
+    ax_corr.set_xticklabels(corr.columns, rotation=90)
+    ax_corr.set_yticklabels(corr.columns)
+    st.pyplot(fig_corr)
+
+    # Partie: Matrice de majoration
+    st.subheader("Matrice de majoration")
+    try:
+        from majoration import calculate_score  # l'utilisateur doit fournir cette fonction
+        score_matrix = calculate_score(df_prod)
+        st.write(score_matrix)
+        # Visualisation de la matrice de score
+        fig_score, ax_score = plt.subplots()
+        cax2 = ax_score.matshow(score_matrix)
+        fig_score.colorbar(cax2)
+        ax_score.set_title('Matrice de majoration')
+        st.pyplot(fig_score)
+    except ImportError:
+        st.error("La fonction calculate_score() de votre module 'majoration' n'a pas été trouvée. Assurez-vous de l'avoir dans le même dossier.")
+
+if _name_ == '_main_':
+    main()
