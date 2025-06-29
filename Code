@@ -1,43 +1,25 @@
-from scipy.optimize import Bounds
+Toujours afficher les détails
 
-# Borne minimale et maximale pour Mjk
-M_min, M_max = 0.5, 2.0
+Copier
+# Re-importation des bibliothèques après le reset
+import numpy as np
+from scipy.optimize import minimize
 
-# Fonction de calcul de Mjk avec bornes
-def constraint_Mjk(params, segments_conversion, segments_ELR, n_conversion, n_ELR, epsilon):
-    alpha, beta, k = params
-    M_jk = ((segments_conversion / n_conversion) ** alpha) * \
-           ((segments_ELR / n_ELR) ** beta) * \
-           (1 - k * epsilon)
-    return np.clip(M_jk, M_min, M_max)  # Clip pour respecter les bornes
+# Génération de données fictives pour tester
+np.random.seed(42)
+num_activities = 100
+n_conversion = 10
+n_ELR = 10
 
-# Adapter la fonction de majoration moyenne pour respecter les bornes
-def majoration_moyenne_borne(params, T, segments_conversion, segments_ELR, n_conversion, n_ELR, epsilon):
-    M_jk = constraint_Mjk(params, segments_conversion, segments_ELR, n_conversion, n_ELR, epsilon)
-    numerateur = np.sum(T * M_jk)
-    denominateur = np.sum(T)
-    return numerateur / denominateur
+# Tarifs avant majoration (fictifs)
+T = np.random.uniform(100, 500, size=num_activities)
 
-# Fonction objectif mise à jour
-def objectif_borne(params, T, segments_conversion, segments_ELR, n_conversion, n_ELR, epsilon, majoration_cible):
-    majoration = majoration_moyenne_borne(params, T, segments_conversion, segments_ELR, n_conversion, n_ELR, epsilon)
-    return (majoration - majoration_cible) ** 2
+# Segments fictifs pour chaque activité
+segments_conversion = np.random.randint(1, n_conversion + 1, size=num_activities)
+segments_ELR = np.random.randint(1, n_ELR + 1, size=num_activities)
 
-# Optimisation avec des bornes pour les paramètres
-bounds_params = [(0.1, 10), (0.1, 10), (0, 2)]  # Bornes pour alpha, beta, k
+# Élasticités fictives pour chaque activité
+epsilon = np.random.uniform(0.05, 0.3, size=num_activities)
 
-result_borne = minimize(
-    objectif_borne,
-    params_init_adjusted,
-    args=(T, segments_conversion, segments_ELR, n_conversion, n_ELR, epsilon, majoration_cible),
-    bounds=bounds_params,
-    method='L-BFGS-B'
-)
-
-# Résultats après optimisation avec bornes
-optimized_params_borne = result_borne.x
-optimized_majoration_borne = majoration_moyenne_borne(
-    optimized_params_borne, T, segments_conversion, segments_ELR, n_conversion, n_ELR, epsilon
-)
-
-optimized_params_borne, optimized_majoration_borne
+# Majoration cible (exemple de valeur cible globale fictive)
+majoration_cible = 1.15
