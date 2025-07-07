@@ -1,98 +1,158 @@
-## Problème d’optimisation tarifaire
+# Bloc 1 : Import des bibliothèques et lecture des données
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
 
-### 1. Variables et indices  
-- \(K\) : nombre d’activités  
-- Pour chaque activité \(k=1,\dots,K\) :  
-  - Segments :  
-    \[
-      i(k)\in\{1,\dots,n_{\rm ELR}\}, 
-      \quad
-      j(k)\in\{1,\dots,n_{\rm Concr}\}
-    \]
-  - Volumes :  
-    \[
-      P^{(k)}\quad\text{(primes)},\quad
-      ELR_{\rm obs}^{(k)},\quad
-      CR_{\rm obs}^{(k)}
-    \]
+# Charger le dataset (remplacez 'data.csv' par le chemin de votre fichier)
+df = pd.read_csv('data.csv')
 
----
+# Renommer les colonnes pour plus de clarté
+df = df.rename(columns={
+    'num activite': 'activity_id',
+    'taux de elr': 'ELR_obs',
+    'taux de concretisation': 'CR_obs',
+    'groupe elr': 'group_ELR',
+    'groupe taux de concretisation': 'group_CR'
+})
 
-### 2. Modélisation de la majoration  
-Pour chaque cellule \((i,j)\) :
-\[
-M_{i,j}
-\;=\;
-\Bigl(\frac{i}{n_{\rm ELR}}\Bigr)^{\alpha}
-\;\times\;
-\Bigl(\frac{j}{n_{\rm Concr}}\Bigr)^{\beta}
-\;\times\;
-M_{\max},
-\]
-avec  
-\[
-\alpha > 0,\quad
-\beta > 0,\quad
-M_{\max} \ge 1.
-\]
-Pour chaque activité \(k\), on note :
-\[
-M^{(k)} = M_{\,i(k),\,j(k)}.
-\]
+# Affichage sommaire
+print("Aperçu des données :")
+display(df.head())
 
----
+# Définition des dimensions de segmentation
+n_ELR = int(df['group_ELR'].max())
+n_Concr = int(df['group_CR'].max())
+print(f"Segments ELR : 1 à {n_ELR}, Segments Concrétisation : 1 à {n_Concr}")
 
-### 3. ELR projeté et conversion prédite  
-\[
-ELR_{\rm proj}^{(k)}
-= \frac{ELR_{\rm obs}^{(k)}}{M^{(k)}},
-\qquad
-CR_{\rm pred}^{(k)}
-= CR_{\rm obs}^{(k)} \,\bigl(M^{(k)}\bigr)^{-\varepsilon},
-\]
-avec  
-\(\varepsilon > 0\).
+# ------------------------------------------------------------------------------
+# Bloc 2 : Préparation des indices et poids
+# ------------------------------------------------------------------------------
 
----
+# Indices i(k), j(k) pour chaque activité
+df['i'] = df['group_ELR']
+df['j'] = df['group_CR']
 
-### 4. Fonction objectif  
-Définissons deux composantes :
-1. *Contrôle du risque*  
-   \[
-   L_E
-   = \sum_{k=1}^K w^E_k \,\bigl(ELR_{\rm proj}^{(k)} - ELR_{\rm target}^{(k)}\bigr)^2.
-   \]
-2. *Préservation de la conversion*  
-   \[
-   L_C
-   = \sum_{k=1}^K w^C_k \,\bigl(CR_{\rm obs}^{(k)} - CR_{\rm pred}^{(k)}\bigr)^2.
-   \]
+# Poids P^(k) sur chaque activité (ici égal à 1 par défaut, à ajuster selon volume de primes)
+df['P'] = 1.0
 
-On cherche à minimiser la somme pondérée :
-\[
-\min_{\alpha,\beta,M_{\max},\varepsilon}
-\;\Bigl[\;\lambda_E\,L_E \;+\; \lambda_C\,L_C\Bigr],
-\]
-où \(\lambda_E,\lambda_C>0\) arbitrent l’importance relative du risque et de la conversion.
+# Poids pondérateurs pour L_E et L_C (égaux à P ici)
+df['wE'] = df['P']
+df['wC'] = df['P']
 
----
+# Cible de surcharge moyenne (ex. +5% => mu_cible = 1.05)
+mu_cible = 1.05
 
-### 5. Contrainte de surcharge moyenne  
-Pour respecter une majoration moyenne cible \(\mu_{\rm cible}\) :
-\[
-\frac{\sum_{k=1}^K M^{(k)}\,P^{(k)}}{\sum_{k=1}^K P^{(k)}}
-\;=\;\mu_{\rm cible}.
-\]
+# Cible ELR projeté : on prend pour l'instant la valeur observée (pas d'écart voulu)
+df['ELR_target'] = df['ELR_obs']
 
----
+# ------------------------------------------------------------------------------
+# Bloc 3 : Définition des fonctions de calcul M, ELR_proj et CR_pred
+# ------------------------------------------------------------------------------
 
-### 6. Bornes sur les paramètres  
-On impose des bornes réalistes :
-\[
-\begin{aligned}
-0 &\le \alpha \le 5,\\
-0 &\le \beta \le 5,\\
-1 &\le M_{\max} \le 3,\\
-0.1 &\le \varepsilon \le 3.
-\end{aligned}
-\]
+def compute_M(params, i, j):
+    """
+    Calcule M_{i,j} = (i/n_ELR)^alpha * (j/n_Concr)^beta * M_max
+    Entrées :
+      - params : [alpha, beta, M_max, epsilon]
+      - i, j : indices de segment
+    """
+    alpha, beta, M_max, _ = params
+    return (i / n_ELR)*alpha * (j / n_Concr)*beta * M_max
+
+def compute_objectives(params):
+    """
+    Calcule L_E et L_C pour un vecteur de paramètres.
+    """
+    alpha, beta, M_max, epsilon = params
+    
+    # Calcul de M^(k)
+    M_vec = compute_M(params, df['i'].values, df['j'].values)
+    
+    # ELR projeté et conversion prédite
+    ELR_proj = df['ELR_obs'].values / M_vec
+    CR_pred  = df['CR_obs'].values * (M_vec ** (-epsilon))
+    
+    # Terme risque (L_E)
+    L_E = np.sum(df['wE'].values * (ELR_proj - df['ELR_target'].values)**2)
+    
+    # Terme conversion (L_C)
+    L_C = np.sum(df['wC'].values * (df['CR_obs'].values - CR_pred)**2)
+    
+    return L_E, L_C, M_vec
+
+# ------------------------------------------------------------------------------
+# Bloc 4 : Fonction objectif global et contrainte de surcharge moyenne
+# ------------------------------------------------------------------------------
+
+# Poids relatifs pour arbitrer risque vs conversion
+lambda_E = 1.0
+lambda_C = 1.0
+
+def loss(params):
+    """Fonction à minimiser : lambda_E*L_E + lambda_C*L_C"""
+    L_E, L_C, _ = compute_objectives(params)
+    return lambda_E * L_E + lambda_C * L_C
+
+def constraint_avg_surcharge(params):
+    """Contrainte : surcharge moyenne = mu_cible"""
+    _, _, M_vec = compute_objectives(params)
+    P_vec = df['P'].values
+    return np.sum(M_vec * P_vec) / np.sum(P_vec) - mu_cible
+
+# ------------------------------------------------------------------------------
+# Bloc 5 : Définition des bornes et initialisation
+# ------------------------------------------------------------------------------
+
+# Bornes sur [alpha, beta, M_max, epsilon]
+bounds = [
+    (0.0, 5.0),   # alpha
+    (0.0, 5.0),   # beta
+    (1.0, 3.0),   # M_max
+    (0.1, 3.0)    # epsilon
+]
+
+# Contrainte d'égalité moyenne
+cons = ({
+    'type': 'eq',
+    'fun': constraint_avg_surcharge
+},)
+
+# Valeurs initiales plausibles
+x0 = [1.0, 1.0, 1.05, 1.0]
+
+# ------------------------------------------------------------------------------
+# Bloc 6 : Résolution de l'optimisation
+# ------------------------------------------------------------------------------
+
+res = minimize(
+    fun=loss,
+    x0=x0,
+    bounds=bounds,
+    constraints=cons,
+    method='SLSQP',
+    options={'maxiter': 500, 'ftol': 1e-9}
+)
+
+# Affichage des résultats
+print("Statut de la résolution :", res.success, "-", res.message)
+alpha_opt, beta_opt, Mmax_opt, eps_opt = res.x
+print(f"alpha* = {alpha_opt:.4f}, beta* = {beta_opt:.4f}, M_max* = {Mmax_opt:.4f}, epsilon* = {eps_opt:.4f}")
+
+# ------------------------------------------------------------------------------
+# Bloc 7 : Analyse post-optimisation
+# ------------------------------------------------------------------------------
+
+# Calcul final
+L_E_opt, L_C_opt, M_vec_opt = compute_objectives(res.x)
+
+df_result = df.copy()
+df_result['M_opt'] = M_vec_opt
+df_result['ELR_proj_opt'] = df_result['ELR_obs'] / df_result['M_opt']
+df_result['CR_pred_opt'] = df_result['CR_obs'] * (df_result['M_opt'] ** (-eps_opt))
+
+print("Aperçu des résultats optimisés :")
+display(df_result.head())
+
+# Vérification de la surcharge moyenne
+avg_surcharge = np.sum(df_result['M_opt'] * df_result['P']) / np.sum(df_result['P'])
+print(f"Surcharge moyenne finale : {avg_surcharge:.4f} (cible {mu_cible})")
