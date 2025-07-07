@@ -1,25 +1,98 @@
-Toujours afficher les détails
+## Problème d’optimisation tarifaire
 
-Copier
-# Re-importation des bibliothèques après le reset
-import numpy as np
-from scipy.optimize import minimize
+### 1. Variables et indices  
+- \(K\) : nombre d’activités  
+- Pour chaque activité \(k=1,\dots,K\) :  
+  - Segments :  
+    \[
+      i(k)\in\{1,\dots,n_{\rm ELR}\}, 
+      \quad
+      j(k)\in\{1,\dots,n_{\rm Concr}\}
+    \]
+  - Volumes :  
+    \[
+      P^{(k)}\quad\text{(primes)},\quad
+      ELR_{\rm obs}^{(k)},\quad
+      CR_{\rm obs}^{(k)}
+    \]
 
-# Génération de données fictives pour tester
-np.random.seed(42)
-num_activities = 100
-n_conversion = 10
-n_ELR = 10
+---
 
-# Tarifs avant majoration (fictifs)
-T = np.random.uniform(100, 500, size=num_activities)
+### 2. Modélisation de la majoration  
+Pour chaque cellule \((i,j)\) :
+\[
+M_{i,j}
+\;=\;
+\Bigl(\frac{i}{n_{\rm ELR}}\Bigr)^{\alpha}
+\;\times\;
+\Bigl(\frac{j}{n_{\rm Concr}}\Bigr)^{\beta}
+\;\times\;
+M_{\max},
+\]
+avec  
+\[
+\alpha > 0,\quad
+\beta > 0,\quad
+M_{\max} \ge 1.
+\]
+Pour chaque activité \(k\), on note :
+\[
+M^{(k)} = M_{\,i(k),\,j(k)}.
+\]
 
-# Segments fictifs pour chaque activité
-segments_conversion = np.random.randint(1, n_conversion + 1, size=num_activities)
-segments_ELR = np.random.randint(1, n_ELR + 1, size=num_activities)
+---
 
-# Élasticités fictives pour chaque activité
-epsilon = np.random.uniform(0.05, 0.3, size=num_activities)
+### 3. ELR projeté et conversion prédite  
+\[
+ELR_{\rm proj}^{(k)}
+= \frac{ELR_{\rm obs}^{(k)}}{M^{(k)}},
+\qquad
+CR_{\rm pred}^{(k)}
+= CR_{\rm obs}^{(k)} \,\bigl(M^{(k)}\bigr)^{-\varepsilon},
+\]
+avec  
+\(\varepsilon > 0\).
 
-# Majoration cible (exemple de valeur cible globale fictive)
-majoration_cible = 1.15
+---
+
+### 4. Fonction objectif  
+Définissons deux composantes :
+1. *Contrôle du risque*  
+   \[
+   L_E
+   = \sum_{k=1}^K w^E_k \,\bigl(ELR_{\rm proj}^{(k)} - ELR_{\rm target}^{(k)}\bigr)^2.
+   \]
+2. *Préservation de la conversion*  
+   \[
+   L_C
+   = \sum_{k=1}^K w^C_k \,\bigl(CR_{\rm obs}^{(k)} - CR_{\rm pred}^{(k)}\bigr)^2.
+   \]
+
+On cherche à minimiser la somme pondérée :
+\[
+\min_{\alpha,\beta,M_{\max},\varepsilon}
+\;\Bigl[\;\lambda_E\,L_E \;+\; \lambda_C\,L_C\Bigr],
+\]
+où \(\lambda_E,\lambda_C>0\) arbitrent l’importance relative du risque et de la conversion.
+
+---
+
+### 5. Contrainte de surcharge moyenne  
+Pour respecter une majoration moyenne cible \(\mu_{\rm cible}\) :
+\[
+\frac{\sum_{k=1}^K M^{(k)}\,P^{(k)}}{\sum_{k=1}^K P^{(k)}}
+\;=\;\mu_{\rm cible}.
+\]
+
+---
+
+### 6. Bornes sur les paramètres  
+On impose des bornes réalistes :
+\[
+\begin{aligned}
+0 &\le \alpha \le 5,\\
+0 &\le \beta \le 5,\\
+1 &\le M_{\max} \le 3,\\
+0.1 &\le \varepsilon \le 3.
+\end{aligned}
+\]
