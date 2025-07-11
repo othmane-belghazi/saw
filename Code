@@ -1,158 +1,89 @@
-# Bloc 1 : Import des bibliothèques et lecture des données
-import pandas as pd
-import numpy as np
-from scipy.optimize import minimize
+# 📌 Problème d'Optimisation de Majoration Tarifaire avec Fonction Sigmoïde
 
-# Charger le dataset (remplacez 'data.csv' par le chemin de votre fichier)
-df = pd.read_csv('data.csv')
+## 🎯 Objectif
 
-# Renommer les colonnes pour plus de clarté
-df = df.rename(columns={
-    'num activite': 'activity_id',
-    'taux de elr': 'ELR_obs',
-    'taux de concretisation': 'CR_obs',
-    'groupe elr': 'group_ELR',
-    'groupe taux de concretisation': 'group_CR'
-})
+Trouver les **paramètres optimaux** d'une fonction de majoration tarifaire basée sur les segments de **conversion** et **risque** des activités, afin que la **majoration moyenne pondérée** des activités soit **aussi proche que possible d'une cible métier fixée**.
 
-# Affichage sommaire
-print("Aperçu des données :")
-display(df.head())
+---
 
-# Définition des dimensions de segmentation
-n_ELR = int(df['group_ELR'].max())
-n_Concr = int(df['group_CR'].max())
-print(f"Segments ELR : 1 à {n_ELR}, Segments Concrétisation : 1 à {n_Concr}")
+## ⚙️ Données disponibles
 
-# ------------------------------------------------------------------------------
-# Bloc 2 : Préparation des indices et poids
-# ------------------------------------------------------------------------------
+Chaque activité \( k \in \{1, ..., N\} \) est décrite par :
 
-# Indices i(k), j(k) pour chaque activité
-df['i'] = df['group_ELR']
-df['j'] = df['group_CR']
+- \( i_k \in \{1, ..., 10\} \) : segment de **conversion**
+- \( j_k \in \{1, ..., 20\} \) : segment de **risque**
+- \( P_k \in \mathbb{R}^+ \) : **prix** ou montant associé à l’activité
+- \( ELR_k \in [0, 1] \) : taux de sinistralité observé (facultatif, pour contrainte)
+- \( TC_k \in [0, 1] \) : taux de conversion observé (facultatif, pour contrainte)
 
-# Poids P^(k) sur chaque activité (ici égal à 1 par défaut, à ajuster selon volume de primes)
-df['P'] = 1.0
+---
 
-# Poids pondérateurs pour L_E et L_C (égaux à P ici)
-df['wE'] = df['P']
-df['wC'] = df['P']
+## 🧮 Formule de la majoration
 
-# Cible de surcharge moyenne (ex. +5% => mu_cible = 1.05)
-mu_cible = 1.05
+On modélise la **majoration multiplicative** \( M_k \) de l’activité \( k \) par une **fonction sigmoïde croisée** :
 
-# Cible ELR projeté : on prend pour l'instant la valeur observée (pas d'écart voulu)
-df['ELR_target'] = df['ELR_obs']
+\[
+M_k = 1 + M_{\max} \cdot \sigma\left(a \cdot (i_k - c_i)\right) \cdot \sigma\left(b \cdot (j_k - c_j)\right)
+\]
 
-# ------------------------------------------------------------------------------
-# Bloc 3 : Définition des fonctions de calcul M, ELR_proj et CR_pred
-# ------------------------------------------------------------------------------
+où :
 
-def compute_M(params, i, j):
-    """
-    Calcule M_{i,j} = (i/n_ELR)^alpha * (j/n_Concr)^beta * M_max
-    Entrées :
-      - params : [alpha, beta, M_max, epsilon]
-      - i, j : indices de segment
-    """
-    alpha, beta, M_max, _ = params
-    return (i / n_ELR)*alpha * (j / n_Concr)*beta * M_max
+- \( \sigma(x) = \frac{1}{1 + e^{-x}} \) est la fonction sigmoïde
+- \( a, b \in \mathbb{R}^+ \) : contrôlent la pente de la croissance sur conversion et risque
+- \( c_i \in [1, 10], c_j \in [1, 20] \) : seuils de déclenchement des majorations
+- \( M_{\max} \in \mathbb{R}^+ \) : majoration maximale autorisée (ex. 7% → 0.07)
 
-def compute_objectives(params):
-    """
-    Calcule L_E et L_C pour un vecteur de paramètres.
-    """
-    alpha, beta, M_max, epsilon = params
-    
-    # Calcul de M^(k)
-    M_vec = compute_M(params, df['i'].values, df['j'].values)
-    
-    # ELR projeté et conversion prédite
-    ELR_proj = df['ELR_obs'].values / M_vec
-    CR_pred  = df['CR_obs'].values * (M_vec ** (-epsilon))
-    
-    # Terme risque (L_E)
-    L_E = np.sum(df['wE'].values * (ELR_proj - df['ELR_target'].values)**2)
-    
-    # Terme conversion (L_C)
-    L_C = np.sum(df['wC'].values * (df['CR_obs'].values - CR_pred)**2)
-    
-    return L_E, L_C, M_vec
+---
 
-# ------------------------------------------------------------------------------
-# Bloc 4 : Fonction objectif global et contrainte de surcharge moyenne
-# ------------------------------------------------------------------------------
+## 📈 Majoration moyenne pondérée
 
-# Poids relatifs pour arbitrer risque vs conversion
-lambda_E = 1.0
-lambda_C = 1.0
+La **majoration moyenne observée** est calculée par :
 
-def loss(params):
-    """Fonction à minimiser : lambda_E*L_E + lambda_C*L_C"""
-    L_E, L_C, _ = compute_objectives(params)
-    return lambda_E * L_E + lambda_C * L_C
+\[
+\text{Majoration moyenne} = \left( \frac{\sum_{k=1}^N M_k \cdot P_k}{\sum_{k=1}^N P_k} \right) - 1
+\]
 
-def constraint_avg_surcharge(params):
-    """Contrainte : surcharge moyenne = mu_cible"""
-    _, _, M_vec = compute_objectives(params)
-    P_vec = df['P'].values
-    return np.sum(M_vec * P_vec) / np.sum(P_vec) - mu_cible
+---
 
-# ------------------------------------------------------------------------------
-# Bloc 5 : Définition des bornes et initialisation
-# ------------------------------------------------------------------------------
+## ✅ Problème d'optimisation
 
-# Bornes sur [alpha, beta, M_max, epsilon]
-bounds = [
-    (0.0, 5.0),   # alpha
-    (0.0, 5.0),   # beta
-    (1.0, 3.0),   # M_max
-    (0.1, 3.0)    # epsilon
-]
+### But :
+Minimiser l'écart entre la **majoration moyenne** et une **majoration cible** \( M_{\text{cible}} \)
 
-# Contrainte d'égalité moyenne
-cons = ({
-    'type': 'eq',
-    'fun': constraint_avg_surcharge
-},)
+\[
+\min_{a, b, c_i, c_j} \left( \left( \frac{\sum_{k=1}^N M_k \cdot P_k}{\sum_{k=1}^N P_k} \right) - 1 - M_{\text{cible}} \right)^2
+\]
 
-# Valeurs initiales plausibles
-x0 = [1.0, 1.0, 1.05, 1.0]
+### Sous contraintes :
 
-# ------------------------------------------------------------------------------
-# Bloc 6 : Résolution de l'optimisation
-# ------------------------------------------------------------------------------
+- \( a, b \geq 0 \)
+- \( c_i \in [1, 10], \quad c_j \in [1, 20] \)
+- \( M_k \in [1, 1 + M_{\max}] \quad \forall k \)
 
-res = minimize(
-    fun=loss,
-    x0=x0,
-    bounds=bounds,
-    constraints=cons,
-    method='SLSQP',
-    options={'maxiter': 500, 'ftol': 1e-9}
-)
+### (Optionnel) Contraintes métier locales par activité :
 
-# Affichage des résultats
-print("Statut de la résolution :", res.success, "-", res.message)
-alpha_opt, beta_opt, Mmax_opt, eps_opt = res.x
-print(f"alpha* = {alpha_opt:.4f}, beta* = {beta_opt:.4f}, M_max* = {Mmax_opt:.4f}, epsilon* = {eps_opt:.4f}")
+- \( ELR^{\text{proj}}_k = ELR_k \cdot M_k \leq ELR_k \cdot (1 + \epsilon_{elr}) \)
+- \( TC^{\text{proj}}_k = TC_k / M_k \geq TC_k \cdot (1 - \epsilon_{tc}) \)
 
-# ------------------------------------------------------------------------------
-# Bloc 7 : Analyse post-optimisation
-# ------------------------------------------------------------------------------
+avec \( \epsilon_{elr}, \epsilon_{tc} \) des marges acceptables définies par le métier.
 
-# Calcul final
-L_E_opt, L_C_opt, M_vec_opt = compute_objectives(res.x)
+---
 
-df_result = df.copy()
-df_result['M_opt'] = M_vec_opt
-df_result['ELR_proj_opt'] = df_result['ELR_obs'] / df_result['M_opt']
-df_result['CR_pred_opt'] = df_result['CR_obs'] * (df_result['M_opt'] ** (-eps_opt))
+## 🧠 Interprétation des paramètres
 
-print("Aperçu des résultats optimisés :")
-display(df_result.head())
+| Paramètre | Rôle | Interprétation métier |
+|-----------|------|------------------------|
+| \( a \) | pente sur conversion | Plus \( a \) est grand, plus la majoration réagit rapidement aux segments de conversion |
+| \( b \) | pente sur risque | Plus \( b \) est grand, plus on pénalise vite les segments de risque |
+| \( c_i \) | centre de la sigmoïde conversion | Segment de conversion à partir duquel on commence à majorer significativement |
+| \( c_j \) | centre de la sigmoïde risque | Segment de risque à partir duquel on commence à majorer significativement |
+| \( M_{\max} \) | plafond | Niveau maximal de majoration autorisé (ex. 7%) |
 
-# Vérification de la surcharge moyenne
-avg_surcharge = np.sum(df_result['M_opt'] * df_result['P']) / np.sum(df_result['P'])
-print(f"Surcharge moyenne finale : {avg_surcharge:.4f} (cible {mu_cible})")
+---
+
+## 📌 À implémenter ensuite
+
+- Génération de données aléatoires simulées ou chargement réel
+- Implémentation de la fonction de coût
+- Optimisation (ex : `scipy.optimize.minimize`)
+- Visualisation des majorations (heatmap ou 3D)
