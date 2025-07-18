@@ -1,89 +1,87 @@
-# 📌 Problème d'Optimisation de Majoration Tarifaire avec Fonction Sigmoïde
+ Avantages de l’approche sigmoïde pour le coefficient de majoration
+1. Contrôle fin et progressif
+Les sigmoïdes permettent d’étaler la montée de la majoration sur une plage de segments (et pas brutale comme un seuil ou un palier).
 
-## 🎯 Objectif
+Le métier peut ajuster la progressivité ou agressivité de la politique tarifaire.
 
-Trouver les **paramètres optimaux** d'une fonction de majoration tarifaire basée sur les segments de **conversion** et **risque** des activités, afin que la **majoration moyenne pondérée** des activités soit **aussi proche que possible d'une cible métier fixée**.
+2. Bornage naturel
+La sigmoïde est toujours entre 0 et 1 → la majoration est bornée entre 
+1
+1 et 
+1
++
+𝑀
+max
+1+M 
+max
+​
+ , ce qui protège contre les explosions tarifaires.
 
----
+3. Paramètres interprétables
+Chaque paramètre a une interprétation métier directe :
 
-## ⚙️ Données disponibles
+𝑎
+a, 
+𝑏
+b = pente (sensibilité aux segments)
 
-Chaque activité \( k \in \{1, ..., N\} \) est décrite par :
+𝑐
+𝑖
+c 
+i
+​
+ , 
+𝑐
+𝑗
+c 
+j
+​
+  = centre (seuil métier)
 
-- \( i_k \in \{1, ..., 10\} \) : segment de **conversion**
-- \( j_k \in \{1, ..., 20\} \) : segment de **risque**
-- \( P_k \in \mathbb{R}^+ \) : **prix** ou montant associé à l’activité
-- \( ELR_k \in [0, 1] \) : taux de sinistralité observé (facultatif, pour contrainte)
-- \( TC_k \in [0, 1] \) : taux de conversion observé (facultatif, pour contrainte)
+Cela rend la solution explicable et justifiable auprès des décideurs.
 
----
+4. Forme différentiable
+La fonction est continue et dérivable partout → optimisation fluide possible avec des solveurs classiques (gradient-based).
 
-## 🧮 Formule de la majoration
+5. Evite les extrêmes
+Contrairement à une approche puissance ou exponentielle, la sigmoïde n’écrase pas trop les faibles segments, ni n’explose sur les grands.
 
-On modélise la **majoration multiplicative** \( M_k \) de l’activité \( k \) par une **fonction sigmoïde croisée** :
+⚠️ Inconvénients et difficultés en optimisation
+1. Fonction non convexe
+Le produit de deux sigmoïdes rend la surface de majoration non convexe.
 
-\[
-M_k = 1 + M_{\max} \cdot \sigma\left(a \cdot (i_k - c_i)\right) \cdot \sigma\left(b \cdot (j_k - c_j)\right)
-\]
+➤ L’optimisation peut converger vers des minima locaux → résultats dépendants des points de départ.
 
-où :
+2. Corrélation entre paramètres
+Les paramètres 
+𝑎
+,
+𝑏
+a,b et 
+𝑐
+𝑖
+,
+𝑐
+𝑗
+c 
+i
+​
+ ,c 
+j
+​
+  sont interdépendants : changer 
+𝑐
+𝑖
+c 
+i
+​
+  peut affecter l'effet de 
+𝑎
+a.
 
-- \( \sigma(x) = \frac{1}{1 + e^{-x}} \) est la fonction sigmoïde
-- \( a, b \in \mathbb{R}^+ \) : contrôlent la pente de la croissance sur conversion et risque
-- \( c_i \in [1, 10], c_j \in [1, 20] \) : seuils de déclenchement des majorations
-- \( M_{\max} \in \mathbb{R}^+ \) : majoration maximale autorisée (ex. 7% → 0.07)
+➤ Cela peut compliquer l’interprétation des résultats optimaux.
 
----
+3. Difficile à calibrer si trop de contraintes
+Si tu ajoutes beaucoup de contraintes non linéaires (par exemple des ELR bornés par activité), cela alourdit la résolution numérique.
 
-## 📈 Majoration moyenne pondérée
-
-La **majoration moyenne observée** est calculée par :
-
-\[
-\text{Majoration moyenne} = \left( \frac{\sum_{k=1}^N M_k \cdot P_k}{\sum_{k=1}^N P_k} \right) - 1
-\]
-
----
-
-## ✅ Problème d'optimisation
-
-### But :
-Minimiser l'écart entre la **majoration moyenne** et une **majoration cible** \( M_{\text{cible}} \)
-
-\[
-\min_{a, b, c_i, c_j} \left( \left( \frac{\sum_{k=1}^N M_k \cdot P_k}{\sum_{k=1}^N P_k} \right) - 1 - M_{\text{cible}} \right)^2
-\]
-
-### Sous contraintes :
-
-- \( a, b \geq 0 \)
-- \( c_i \in [1, 10], \quad c_j \in [1, 20] \)
-- \( M_k \in [1, 1 + M_{\max}] \quad \forall k \)
-
-### (Optionnel) Contraintes métier locales par activité :
-
-- \( ELR^{\text{proj}}_k = ELR_k \cdot M_k \leq ELR_k \cdot (1 + \epsilon_{elr}) \)
-- \( TC^{\text{proj}}_k = TC_k / M_k \geq TC_k \cdot (1 - \epsilon_{tc}) \)
-
-avec \( \epsilon_{elr}, \epsilon_{tc} \) des marges acceptables définies par le métier.
-
----
-
-## 🧠 Interprétation des paramètres
-
-| Paramètre | Rôle | Interprétation métier |
-|-----------|------|------------------------|
-| \( a \) | pente sur conversion | Plus \( a \) est grand, plus la majoration réagit rapidement aux segments de conversion |
-| \( b \) | pente sur risque | Plus \( b \) est grand, plus on pénalise vite les segments de risque |
-| \( c_i \) | centre de la sigmoïde conversion | Segment de conversion à partir duquel on commence à majorer significativement |
-| \( c_j \) | centre de la sigmoïde risque | Segment de risque à partir duquel on commence à majorer significativement |
-| \( M_{\max} \) | plafond | Niveau maximal de majoration autorisé (ex. 7%) |
-
----
-
-## 📌 À implémenter ensuite
-
-- Génération de données aléatoires simulées ou chargement réel
-- Implémentation de la fonction de coût
-- Optimisation (ex : `scipy.optimize.minimize`)
-- Visualisation des majorations (heatmap ou 3D)
+➤ Risque de problème mal posé ou peu stable selon la précision exigée.
