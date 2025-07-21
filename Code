@@ -1,87 +1,122 @@
- Avantages de l’approche sigmoïde pour le coefficient de majoration
-1. Contrôle fin et progressif
-Les sigmoïdes permettent d’étaler la montée de la majoration sur une plage de segments (et pas brutale comme un seuil ou un palier).
+# -*- coding: utf-8 -*-
+"""
+Tarification – Optimisation des paramètres (alpha, beta)
+pour la surface de majoration sigmoïde croisée.
 
-Le métier peut ajuster la progressivité ou agressivité de la politique tarifaire.
+Hypothèses :
+* M_max, c_i, c_j fixés (métier)
+* Données d’entrée déjà chargées dans un DataFrame `df` avec les colonnes :
+    - activity_id   : identifiant
+    - group_ELR     : segment ELR (1–20)
+    - group_CR      : segment concrétisation (1–10)
+    - tariff        : tarif de base (prime commerciale)
 
-2. Bornage naturel
-La sigmoïde est toujours entre 0 et 1 → la majoration est bornée entre 
-1
-1 et 
-1
-+
-𝑀
-max
-1+M 
-max
-​
- , ce qui protège contre les explosions tarifaires.
+Objectif : atteindre une surcharge moyenne cible mu_cible
+sous contraintes :
+    - segments ELR 1–8 : majoration ≤ 1 %
+    - segments ELR 11–20 : majoration ≥ 2,04 %
 
-3. Paramètres interprétables
-Chaque paramètre a une interprétation métier directe :
+Méthode : Differential Evolution (global) + SLSQP (local).
+"""
 
-𝑎
-a, 
-𝑏
-b = pente (sensibilité aux segments)
+# ---------------------------------------------------------------------------
+# 1. Imports et lecture des données
+# ---------------------------------------------------------------------------
+import numpy as np
+import pandas as pd
+from scipy.optimize import differential_evolution, minimize
 
-𝑐
-𝑖
-c 
-i
-​
- , 
-𝑐
-𝑗
-c 
-j
-​
-  = centre (seuil métier)
+# df = pd.read_csv('data.csv')  # <-- décommentez et ajustez le chemin
+assert {'group_ELR', 'group_CR', 'tariff'}.issubset(df.columns), "Colonnes manquantes dans le DataFrame !"
 
-Cela rend la solution explicable et justifiable auprès des décideurs.
+i_k = df['group_ELR'].to_numpy(int)  # shape (K,)
+j_k = df['group_CR'].to_numpy(int)
+P    = df['tariff'].to_numpy(float)
 
-4. Forme différentiable
-La fonction est continue et dérivable partout → optimisation fluide possible avec des solveurs classiques (gradient-based).
+# ---------------------------------------------------------------------------
+# 2. Paramètres fixes (métier)
+# ---------------------------------------------------------------------------
+M_max = 0.25      # +25 % maximal
+c_i   = 12.5      # centre ELR
+c_j   = 6.5       # centre concrétisation
+mu_cible = 0.05   # +5 % moyenne cible
 
-5. Evite les extrêmes
-Contrairement à une approche puissance ou exponentielle, la sigmoïde n’écrase pas trop les faibles segments, ni n’explose sur les grands.
+bounds = [(0.05, 2.0),   # alpha
+          (0.05, 1.5)]   # beta
 
-⚠️ Inconvénients et difficultés en optimisation
-1. Fonction non convexe
-Le produit de deux sigmoïdes rend la surface de majoration non convexe.
+I = np.arange(1, 21)[:, None]  # (20,1)
+J = np.arange(1, 11)[None, :]  # (1,10)
 
-➤ L’optimisation peut converger vers des minima locaux → résultats dépendants des points de départ.
+# ---------------------------------------------------------------------------
+# 3. Fonctions utilitaires
+# ---------------------------------------------------------------------------
 
-2. Corrélation entre paramètres
-Les paramètres 
-𝑎
-,
-𝑏
-a,b et 
-𝑐
-𝑖
-,
-𝑐
-𝑗
-c 
-i
-​
- ,c 
-j
-​
-  sont interdépendants : changer 
-𝑐
-𝑖
-c 
-i
-​
-  peut affecter l'effet de 
-𝑎
-a.
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
 
-➤ Cela peut compliquer l’interprétation des résultats optimaux.
 
-3. Difficile à calibrer si trop de contraintes
-Si tu ajoutes beaucoup de contraintes non linéaires (par exemple des ELR bornés par activité), cela alourdit la résolution numérique.
+def m_matrix(alpha, beta):
+    s_i = sigmoid(alpha * (I - c_i))
+    s_j = sigmoid(beta  * (J - c_j))
+    return M_max * s_i * s_j
 
-➤ Risque de problème mal posé ou peu stable selon la précision exigée.
+
+def mean_surcharge(alpha, beta):
+    m = m_matrix(alpha, beta)
+    F_k = 1 + m[i_k - 1, j_k - 1]
+    return (P @ F_k) / P.sum() - 1.0
+
+
+def m_8_10(alpha, beta):
+    return m_matrix(alpha, beta)[7, 9]
+
+
+def m_11_1(alpha, beta):
+    return m_matrix(alpha, beta)[10, 0]
+
+# ---------------------------------------------------------------------------
+# 4. Objectif et contraintes
+# ---------------------------------------------------------------------------
+
+def objective(x):
+    diff = mean_surcharge(*x) - mu_cible
+    return diff * diff
+
+cons = [
+    {'type': 'ineq', 'fun': lambda x: 0.01 - m_8_10(*x)},
+    {'type': 'ineq', 'fun': lambda x: m_11_1(*x) - 0.020408}
+]
+
+# ---------------------------------------------------------------------------
+# 5. Differential Evolution (global)
+# ---------------------------------------------------------------------------
+
+def penalized_obj(x):
+    if (m_8_10(*x) > 0.01) or (m_11_1(*x) < 0.020408):
+        return 1e6
+    return objective(x)
+
+res_de = differential_evolution(penalized_obj, bounds=bounds, popsize=30, maxiter=40, seed=42)
+print(f"DE: alpha≈{res_de.x[0]:.4f}, beta≈{res_de.x[1]:.4f}, obj={res_de.fun:.3e}")
+
+# ---------------------------------------------------------------------------
+# 6. SLSQP local (raffinement)
+# ---------------------------------------------------------------------------
+res_local = minimize(objective, x0=res_de.x, method='SLSQP', bounds=bounds, constraints=cons,
+                     options={'ftol': 1e-12, 'maxiter': 300})
+
+alpha_opt, beta_opt = res_local.x
+print("\n=== Solution finale ===")
+print(f"alpha* = {alpha_opt:.4f}")
+print(f"beta*  = {beta_opt:.4f}")
+print(f"moy. surcharge = {mean_surcharge(alpha_opt, beta_opt):.4%}")
+print(f"m(8,10) = {m_8_10(alpha_opt, beta_opt):.4%}")
+print(f"m(11,1) = {m_11_1(alpha_opt, beta_opt):.4%}")
+
+# ---------------------------------------------------------------------------
+# 7. Export (facultatif)
+# ---------------------------------------------------------------------------
+# m_full = m_matrix(alpha_opt, beta_opt)
+# df['factor_opt']  = 1 + m_full[i_k-1, j_k-1]
+# df['tariff_new']  = df['tariff'] * df['factor_opt']
+# df.to_csv('tariff_after_optim.csv', index=False)
