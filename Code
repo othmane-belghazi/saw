@@ -1,118 +1,169 @@
-# optim_spline.py
-# ---------------------------------------------------------------
-# Optimisation d'une surface de majoration 20 x 10 via B‑splines
-# sous contraintes métier (zone verte/rouge + monotonie).
-# ---------------------------------------------------------------
-import pathlib
+import streamlit as st
 import numpy as np
 import pandas as pd
-import cvxpy as cp
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import plotly.graph_objs as go
 
-# ---------------------------------------------------------------
-# 0.  Paramétrage
-# ---------------------------------------------------------------
-CSV_PATH = pathlib.Path("data.csv")     # données source
-LAMBDA    = 100.0                      # paramètre de lissage
-# bornes métier
-MAX_RATE  = 0.25                       # +25 % plafond
-GREEN_MAX = 0.01                       # +1 % zone verte
-RED_MIN   = 0.020408                   # +2,04 % zone rouge
+st.set_page_config(page_title="Grille de surprime – 4 méthodes", layout="wide")
 
-n_i, n_j = 20, 10                      # dimensions grille
+st.title("Grille de surprime – 4 méthodes paramétriques")
 
-# ---------------------------------------------------------------
-# 1.  Lecture (ou création) du fichier data.csv
-# ---------------------------------------------------------------
-if CSV_PATH.exists():
-    df = pd.read_csv(CSV_PATH)
-else:
-    # jeu fictif minimal – remplacez par vos vraies données
-    rng = np.random.default_rng(0)
-    df = pd.DataFrame({
-        "activity_id": np.arange(1, 1_001),
-        "group_ELR":   rng.integers(1, n_i+1, 1_000),
-        "group_CR":    rng.integers(1, n_j+1, 1_000),
-        "tariff":      rng.uniform(300, 1_000, 1_000)
-    })
-    df.to_csv(CSV_PATH, index=False)
-    print("🚩 Exemple data.csv créé ; remplacez-le par vos données réelles.")
+# -----------------------------------------------------------------------------
+# UI – Paramètres généraux
+# -----------------------------------------------------------------------------
+col1, col2, col3 = st.columns(3)
+with col1:
+    n_elr = st.number_input("Nombre de segments ELR", min_value=2, max_value=40, value=20, step=1)
+with col2:
+    n_tc = st.number_input("Nombre de segments TC", min_value=2, max_value=40, value=10, step=1)
+with col3:
+    target_margin = st.number_input("Surcharge moyenne cible (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5) / 100.0
 
-# poids : primes par cellule (agrégées)
-pivot = df.pivot_table(index="group_ELR",
-                       columns="group_CR",
-                       values="tariff",
-                       aggfunc="sum",
-                       fill_value=0.0)
-W = pivot.to_numpy()                   # shape (20,10)
+method = st.selectbox(
+    "Méthode paramétrique", (
+        "1️⃣ Puissance (ELR, TC)",
+        "2️⃣ Suite géométrique aᶦ bʲ (index)",
+        "3️⃣ Exponentielle normalisée",
+        "4️⃣ Exponentielle saturée (tanh)"
+    )
+)
 
-# ---------------------------------------------------------------
-# 2.  Table brute (ici 0) – remplacez si vous avez une première grille
-# ---------------------------------------------------------------
-m_hat = np.zeros((n_i, n_j))
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
-# ---------------------------------------------------------------
-# 3.  Variable spline et objectif
-# ---------------------------------------------------------------
-theta = cp.Variable((n_i, n_j))        # taux de majoration à estimer
+def compute_k(matrix, weights, target):
+    """Calcule k pour atteindre la surcharge moyenne cible."""
+    weighted_avg = np.average(matrix, weights=weights)
+    return (1.0 + target) / weighted_avg
 
-fidelity = cp.sum_squares(cp.multiply(np.sqrt(W), theta - m_hat))
 
-def second_diff(mat, axis):
-    """Deuxième différence discrète (cvxpy)."""
-    return mat[2:, :] - 2*mat[1:-1, :] + mat[:-2, :] if axis == 0 \
-        else mat[:, 2:] - 2*mat[:, 1:-1] + mat[:, :-2]
+def show_matrix_and_surface(M):
+    """Affiche la matrice sous forme de DataFrame et surface 3D."""
+    df = pd.DataFrame(M, index=[f"ELR {i+1}" for i in range(M.shape[0])],
+                      columns=[f"TC {j+1}" for j in range(M.shape[1])])
+    st.subheader("Matrice de surprime")
+    st.dataframe(df.style.format("{:.4f}"), use_container_width=True)
 
-smooth_pen = cp.sum_squares(second_diff(theta, 0)) \
-           + cp.sum_squares(second_diff(theta, 1))
+    st.subheader("Surface 3D")
+    x = np.arange(M.shape[1])  # TC index
+    y = np.arange(M.shape[0])  # ELR index
+    X, Y = np.meshgrid(x, y)
+    fig = go.Figure(data=[go.Surface(z=M, x=X, y=Y, showscale=True)])
+    fig.update_layout(height=600, scene=dict(
+        xaxis_title="Index TC (j)",
+        yaxis_title="Index ELR (i)",
+        zaxis_title="Surprime"
+    ))
+    st.plotly_chart(fig, use_container_width=True)
 
-objective = cp.Minimize(fidelity + LAMBDA * smooth_pen)
 
-# ---------------------------------------------------------------
-# 4.  Contraintes
-# ---------------------------------------------------------------
-cons = [
-    theta >= 0,
-    theta <= MAX_RATE,
-    theta[:8, :]  <= GREEN_MAX,        # zone verte
-    theta[10:, :] >= RED_MIN,          # zone rouge
-    theta[1:, :]  - theta[:-1, :] >= 0,  # monotone en i
-    theta[:, 1:]  - theta[:, :-1] >= 0   # monotone en j
-]
+# -----------------------------------------------------------------------------
+# Construction des grilles représentatives ELR / TC (ou indices)
+# -----------------------------------------------------------------------------
 
-# ---------------------------------------------------------------
-# 5.  Résolution
-# ---------------------------------------------------------------
-prob = cp.Problem(objective, cons)
-prob.solve(solver=cp.OSQP, verbose=True)
+def build_elr_values():
+    elr_min = st.number_input("ELR min (%)", min_value=0.0, max_value=200.0, value=35.0, step=1.0) / 100.0
+    elr_max = st.number_input("ELR max (%)", min_value=0.0, max_value=200.0, value=150.0, step=1.0) / 100.0
+    return np.linspace(elr_min, elr_max, n_elr)
 
-print(f"Statut : {prob.status}")
-print(f"Valeur obj (penalisée) : {prob.value:.4e}")
 
-M = theta.value                      # matrice optimisée
+def build_tc_values():
+    tc_min = st.number_input("TC min (%)", min_value=0.0, max_value=100.0, value=5.0, step=1.0) / 100.0
+    tc_max = st.number_input("TC max (%)", min_value=0.0, max_value=100.0, value=40.0, step=1.0) / 100.0
+    return np.linspace(tc_min, tc_max, n_tc)
 
-# ---------------------------------------------------------------
-# 6.  Export & aperçu
-# ---------------------------------------------------------------
-pd.DataFrame(M,
-             index=[f"i{i+1}" for i in range(n_i)],
-             columns=[f"j{j+1}" for j in range(n_j)]
-).to_csv("maj_spline.csv", float_format="%.5f")
-print("✅ matrice enregistrée sous maj_spline.csv")
-print("Aperçu premières lignes :")
-print(pd.DataFrame(M).round(4).head())
 
-# ---------------------------------------------------------------
-# 7.  Plot 3‑D
-# ---------------------------------------------------------------
-X, Y = np.meshgrid(np.arange(1, n_j+1), np.arange(1, n_i+1))
-fig = plt.figure(figsize=(8, 6))
-ax = fig.add_subplot(111, projection='3d')
-surf = ax.plot_surface(X, Y, M, cmap='viridis', linewidth=0)
-ax.set_xlabel("Segment conversion (j)")
-ax.set_ylabel("Segment ELR (i)")
-ax.set_zlabel("Taux de majoration")
-ax.set_title("Surface de majoration – splines bicubiques")
-plt.tight_layout()
-plt.show()
+# -----------------------------------------------------------------------------
+# Méthode 1 : puissance réelle ELR, TC
+# -----------------------------------------------------------------------------
+
+def method1(elr_vals, tc_vals):
+    st.markdown("***Paramètres méthode 1***")
+    elr_ref = st.number_input("ELR référence (%)", min_value=0.0, max_value=200.0, value=70.0, step=1.0) / 100.0
+    tc_ref = st.number_input("TC référence (%)", min_value=0.0, max_value=100.0, value=25.0, step=1.0) / 100.0
+    alpha = st.slider("α (élasticité ELR)", 0.0, 5.0, 1.0, 0.05)
+    beta = st.slider("β (élasticité TC)", 0.0, 5.0, 1.0, 0.05)
+
+    M0 = np.outer((elr_vals / elr_ref) ** alpha, (tc_vals / tc_ref) ** beta)
+    return M0
+
+
+# -----------------------------------------------------------------------------
+# Méthode 2 : suites géométriques index
+# -----------------------------------------------------------------------------
+
+def method2():
+    st.markdown("***Paramètres méthode 2***")
+    r_elr = st.slider("Multiplicateur total ELR (ratio extrémités)", 1.0, 20.0, 5.0, 0.1)
+    r_tc = st.slider("Multiplicateur total TC (ratio extrémités)", 1.0, 20.0, 5.0, 0.1)
+
+    a = r_elr ** (1 / (n_elr - 1))
+    b = r_tc ** (1 / (n_tc - 1))
+
+    M0 = np.outer(a ** np.arange(n_elr), b ** np.arange(n_tc))
+    return M0
+
+
+# -----------------------------------------------------------------------------
+# Méthode 3 : exponentielle normalisée
+# -----------------------------------------------------------------------------
+
+def method3():
+    st.markdown("***Paramètres méthode 3***")
+    alpha = st.slider("α", 0.0, 10.0, 5.0, 0.1)
+    beta = st.slider("β", 0.0, 10.0, 5.0, 0.1)
+
+    u = (np.arange(n_elr) + 0.5) / n_elr
+    v = (np.arange(n_tc) + 0.5) / n_tc
+
+    M0 = np.exp(np.outer(u * alpha, np.ones(n_tc)) + np.outer(np.ones(n_elr), v * beta))
+    return M0
+
+
+# -----------------------------------------------------------------------------
+# Méthode 4 : exponentielle saturée (tanh)
+# -----------------------------------------------------------------------------
+
+def method4():
+    st.markdown("***Paramètres méthode 4***")
+    alpha = st.slider("α", 0.0, 10.0, 5.0, 0.1)
+    beta = st.slider("β", 0.0, 10.0, 5.0, 0.1)
+    gamma = st.slider("γ (plafond)", 0.1, 10.0, 3.0, 0.1)
+
+    u = (np.arange(n_elr) + 0.5) / n_elr
+    v = (np.arange(n_tc) + 0.5) / n_tc
+
+    S = np.outer(u * alpha, np.ones(n_tc)) + np.outer(np.ones(n_elr), v * beta)
+    M0 = np.exp(gamma * np.tanh(S))
+    return M0
+
+
+# -----------------------------------------------------------------------------
+# Calcul principal
+# -----------------------------------------------------------------------------
+
+def main():
+    if method.startswith("1"):
+        elr_vals = build_elr_values()
+        tc_vals = build_tc_values()
+        M0 = method1(elr_vals, tc_vals)
+    elif method.startswith("2"):
+        M0 = method2()
+    elif method.startswith("3"):
+        M0 = method3()
+    else:
+        M0 = method4()
+
+    # Poids uniformes par défaut (peuvent être remplacés par un upload CSV par ex.)
+    weights = np.ones_like(M0)
+
+    k = compute_k(M0, weights, target_margin)
+    M = k * M0
+
+    st.success(f"Paramètre k calculé : {k:.6f} – Surcharge moyenne = {(M * weights).mean() - 1:.2%}")
+
+    show_matrix_and_surface(M)
+
+
+if __name__ == "__main__":
+    main()
