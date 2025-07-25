@@ -1,86 +1,118 @@
-# Install cvxpy if not available (commented out; for Colab you might need !pip install cvxpy)
-# !pip install cvxpy
-
+# optim_spline.py
+# ---------------------------------------------------------------
+# Optimisation d'une surface de majoration 20 x 10 via B‑splines
+# sous contraintes métier (zone verte/rouge + monotonie).
+# ---------------------------------------------------------------
+import pathlib
 import numpy as np
 import pandas as pd
 import cvxpy as cp
 import matplotlib.pyplot as plt
-import ace_tools as tools
-
-# --- 1. Dimensions ----------------------------------------------------------
-n_i, n_j = 20, 10            # segments ELR × segments Conversion
-I = np.arange(n_i)
-J = np.arange(n_j)
-
-# --- 2. Initial "rough" table (here: all zeros) -----------------------------
-# If you have a historic table, replace `m_hat` by that matrix
-m_hat = np.zeros((n_i, n_j))
-
-# --- 3. Optimisation variables ---------------------------------------------
-theta = cp.Variable((n_i, n_j))
-
-# --- 4. Fidelity term -------------------------------------------------------
-# weights (here: 1 everywhere; could be proportional to premiums)
-W = np.ones((n_i, n_j))
-fidelity = cp.sum_squares(cp.multiply(np.sqrt(W), theta - m_hat))
-
-# --- 5. Smoothness penalty: 2nd differences on both axes -------------------
-def second_diff(mat, axis=0):
-    """Return second finite difference along axis for a cp Variable."""
-    if axis == 0:
-        return mat[2:, :] - 2 * mat[1:-1, :] + mat[:-2, :]
-    else:
-        return mat[:, 2:] - 2 * mat[:, 1:-1] + mat[:, :-2]
-
-penalty = cp.sum_squares(second_diff(theta, axis=0)) + cp.sum_squares(second_diff(theta, axis=1))
-
-lam = 100.0   # smoothing hyper‑parameter
-objective = cp.Minimize(fidelity + lam * penalty)
-
-# --- 6. Constraints ---------------------------------------------------------
-constraints = []
-
-# Zone verte: i <= 7 --> m <= 0.01
-constraints.append(theta[:8, :] <= 0.01)
-
-# Zone rouge: i >= 10 --> m >= 0.020408
-constraints.append(theta[10:, :] >= 0.020408)
-
-# Optional monotonicity on ELR axis (non‑decreasing)
-constraints.append(theta[1:, :] - theta[:-1, :] >= 0)
-
-# Optional monotonicity on conversion axis (non‑decreasing)
-constraints.append(theta[:, 1:] - theta[:, :-1] >= 0)
-
-# Upper bound for stability (<= 0.25)
-constraints.append(theta <= 0.25)
-constraints.append(theta >= 0)  # No negative majoration
-
-# --- 7. Solve --------------------------------------------------------------
-prob = cp.Problem(objective, constraints)
-prob.solve(solver=cp.OSQP, verbose=False)
-
-print("Optimisation status:", prob.status)
-print("Objective value (penalised):", prob.value)
-
-M_opt = theta.value
-
-# --- 8. Display matrix -----------------------------------------------------
-df_M = pd.DataFrame(M_opt, index=[f"i={i+1}" for i in range(n_i)],
-                    columns=[f"j={j+1}" for j in range(n_j)])
-tools.display_dataframe_to_user("Matrice_M_spline", df_M)
-
-# --- 9. 3D surface plot ----------------------------------------------------
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-X, Y = np.meshgrid(np.arange(1, n_j+1), np.arange(1, n_i+1))  # X=j, Y=i
+# ---------------------------------------------------------------
+# 0.  Paramétrage
+# ---------------------------------------------------------------
+CSV_PATH = pathlib.Path("data.csv")     # données source
+LAMBDA    = 100.0                      # paramètre de lissage
+# bornes métier
+MAX_RATE  = 0.25                       # +25 % plafond
+GREEN_MAX = 0.01                       # +1 % zone verte
+RED_MIN   = 0.020408                   # +2,04 % zone rouge
 
+n_i, n_j = 20, 10                      # dimensions grille
+
+# ---------------------------------------------------------------
+# 1.  Lecture (ou création) du fichier data.csv
+# ---------------------------------------------------------------
+if CSV_PATH.exists():
+    df = pd.read_csv(CSV_PATH)
+else:
+    # jeu fictif minimal – remplacez par vos vraies données
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({
+        "activity_id": np.arange(1, 1_001),
+        "group_ELR":   rng.integers(1, n_i+1, 1_000),
+        "group_CR":    rng.integers(1, n_j+1, 1_000),
+        "tariff":      rng.uniform(300, 1_000, 1_000)
+    })
+    df.to_csv(CSV_PATH, index=False)
+    print("🚩 Exemple data.csv créé ; remplacez-le par vos données réelles.")
+
+# poids : primes par cellule (agrégées)
+pivot = df.pivot_table(index="group_ELR",
+                       columns="group_CR",
+                       values="tariff",
+                       aggfunc="sum",
+                       fill_value=0.0)
+W = pivot.to_numpy()                   # shape (20,10)
+
+# ---------------------------------------------------------------
+# 2.  Table brute (ici 0) – remplacez si vous avez une première grille
+# ---------------------------------------------------------------
+m_hat = np.zeros((n_i, n_j))
+
+# ---------------------------------------------------------------
+# 3.  Variable spline et objectif
+# ---------------------------------------------------------------
+theta = cp.Variable((n_i, n_j))        # taux de majoration à estimer
+
+fidelity = cp.sum_squares(cp.multiply(np.sqrt(W), theta - m_hat))
+
+def second_diff(mat, axis):
+    """Deuxième différence discrète (cvxpy)."""
+    return mat[2:, :] - 2*mat[1:-1, :] + mat[:-2, :] if axis == 0 \
+        else mat[:, 2:] - 2*mat[:, 1:-1] + mat[:, :-2]
+
+smooth_pen = cp.sum_squares(second_diff(theta, 0)) \
+           + cp.sum_squares(second_diff(theta, 1))
+
+objective = cp.Minimize(fidelity + LAMBDA * smooth_pen)
+
+# ---------------------------------------------------------------
+# 4.  Contraintes
+# ---------------------------------------------------------------
+cons = [
+    theta >= 0,
+    theta <= MAX_RATE,
+    theta[:8, :]  <= GREEN_MAX,        # zone verte
+    theta[10:, :] >= RED_MIN,          # zone rouge
+    theta[1:, :]  - theta[:-1, :] >= 0,  # monotone en i
+    theta[:, 1:]  - theta[:, :-1] >= 0   # monotone en j
+]
+
+# ---------------------------------------------------------------
+# 5.  Résolution
+# ---------------------------------------------------------------
+prob = cp.Problem(objective, cons)
+prob.solve(solver=cp.OSQP, verbose=True)
+
+print(f"Statut : {prob.status}")
+print(f"Valeur obj (penalisée) : {prob.value:.4e}")
+
+M = theta.value                      # matrice optimisée
+
+# ---------------------------------------------------------------
+# 6.  Export & aperçu
+# ---------------------------------------------------------------
+pd.DataFrame(M,
+             index=[f"i{i+1}" for i in range(n_i)],
+             columns=[f"j{j+1}" for j in range(n_j)]
+).to_csv("maj_spline.csv", float_format="%.5f")
+print("✅ matrice enregistrée sous maj_spline.csv")
+print("Aperçu premières lignes :")
+print(pd.DataFrame(M).round(4).head())
+
+# ---------------------------------------------------------------
+# 7.  Plot 3‑D
+# ---------------------------------------------------------------
+X, Y = np.meshgrid(np.arange(1, n_j+1), np.arange(1, n_i+1))
 fig = plt.figure(figsize=(8, 6))
 ax = fig.add_subplot(111, projection='3d')
-ax.plot_surface(X, Y, M_opt, rstride=1, cstride=1, linewidth=0, antialiased=False)
-ax.set_xlabel("Segment conversion (j)")
-ax.set_ylabel("Segment ELR (i)")
+surf = ax.plot_surface(X, Y, M, cmap='viridis', linewidth=0)
+ax.set_xlabel("Segment conversion (j)")
+ax.set_ylabel("Segment ELR (i)")
 ax.set_zlabel("Taux de majoration")
-ax.set_title("Surface de majoration spline lissée")
+ax.set_title("Surface de majoration – splines bicubiques")
 plt.tight_layout()
 plt.show()
