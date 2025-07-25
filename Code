@@ -1,122 +1,86 @@
-# -*- coding: utf-8 -*-
-"""
-Tarification – Optimisation des paramètres (alpha, beta)
-pour la surface de majoration sigmoïde croisée.
+# Install cvxpy if not available (commented out; for Colab you might need !pip install cvxpy)
+# !pip install cvxpy
 
-Hypothèses :
-* M_max, c_i, c_j fixés (métier)
-* Données d’entrée déjà chargées dans un DataFrame `df` avec les colonnes :
-    - activity_id   : identifiant
-    - group_ELR     : segment ELR (1–20)
-    - group_CR      : segment concrétisation (1–10)
-    - tariff        : tarif de base (prime commerciale)
-
-Objectif : atteindre une surcharge moyenne cible mu_cible
-sous contraintes :
-    - segments ELR 1–8 : majoration ≤ 1 %
-    - segments ELR 11–20 : majoration ≥ 2,04 %
-
-Méthode : Differential Evolution (global) + SLSQP (local).
-"""
-
-# ---------------------------------------------------------------------------
-# 1. Imports et lecture des données
-# ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution, minimize
+import cvxpy as cp
+import matplotlib.pyplot as plt
+import ace_tools as tools
 
-# df = pd.read_csv('data.csv')  # <-- décommentez et ajustez le chemin
-assert {'group_ELR', 'group_CR', 'tariff'}.issubset(df.columns), "Colonnes manquantes dans le DataFrame !"
+# --- 1. Dimensions ----------------------------------------------------------
+n_i, n_j = 20, 10            # segments ELR × segments Conversion
+I = np.arange(n_i)
+J = np.arange(n_j)
 
-i_k = df['group_ELR'].to_numpy(int)  # shape (K,)
-j_k = df['group_CR'].to_numpy(int)
-P    = df['tariff'].to_numpy(float)
+# --- 2. Initial "rough" table (here: all zeros) -----------------------------
+# If you have a historic table, replace `m_hat` by that matrix
+m_hat = np.zeros((n_i, n_j))
 
-# ---------------------------------------------------------------------------
-# 2. Paramètres fixes (métier)
-# ---------------------------------------------------------------------------
-M_max = 0.25      # +25 % maximal
-c_i   = 12.5      # centre ELR
-c_j   = 6.5       # centre concrétisation
-mu_cible = 0.05   # +5 % moyenne cible
+# --- 3. Optimisation variables ---------------------------------------------
+theta = cp.Variable((n_i, n_j))
 
-bounds = [(0.05, 2.0),   # alpha
-          (0.05, 1.5)]   # beta
+# --- 4. Fidelity term -------------------------------------------------------
+# weights (here: 1 everywhere; could be proportional to premiums)
+W = np.ones((n_i, n_j))
+fidelity = cp.sum_squares(cp.multiply(np.sqrt(W), theta - m_hat))
 
-I = np.arange(1, 21)[:, None]  # (20,1)
-J = np.arange(1, 11)[None, :]  # (1,10)
+# --- 5. Smoothness penalty: 2nd differences on both axes -------------------
+def second_diff(mat, axis=0):
+    """Return second finite difference along axis for a cp Variable."""
+    if axis == 0:
+        return mat[2:, :] - 2 * mat[1:-1, :] + mat[:-2, :]
+    else:
+        return mat[:, 2:] - 2 * mat[:, 1:-1] + mat[:, :-2]
 
-# ---------------------------------------------------------------------------
-# 3. Fonctions utilitaires
-# ---------------------------------------------------------------------------
+penalty = cp.sum_squares(second_diff(theta, axis=0)) + cp.sum_squares(second_diff(theta, axis=1))
 
-def sigmoid(z):
-    return 1 / (1 + np.exp(-z))
+lam = 100.0   # smoothing hyper‑parameter
+objective = cp.Minimize(fidelity + lam * penalty)
 
+# --- 6. Constraints ---------------------------------------------------------
+constraints = []
 
-def m_matrix(alpha, beta):
-    s_i = sigmoid(alpha * (I - c_i))
-    s_j = sigmoid(beta  * (J - c_j))
-    return M_max * s_i * s_j
+# Zone verte: i <= 7 --> m <= 0.01
+constraints.append(theta[:8, :] <= 0.01)
 
+# Zone rouge: i >= 10 --> m >= 0.020408
+constraints.append(theta[10:, :] >= 0.020408)
 
-def mean_surcharge(alpha, beta):
-    m = m_matrix(alpha, beta)
-    F_k = 1 + m[i_k - 1, j_k - 1]
-    return (P @ F_k) / P.sum() - 1.0
+# Optional monotonicity on ELR axis (non‑decreasing)
+constraints.append(theta[1:, :] - theta[:-1, :] >= 0)
 
+# Optional monotonicity on conversion axis (non‑decreasing)
+constraints.append(theta[:, 1:] - theta[:, :-1] >= 0)
 
-def m_8_10(alpha, beta):
-    return m_matrix(alpha, beta)[7, 9]
+# Upper bound for stability (<= 0.25)
+constraints.append(theta <= 0.25)
+constraints.append(theta >= 0)  # No negative majoration
 
+# --- 7. Solve --------------------------------------------------------------
+prob = cp.Problem(objective, constraints)
+prob.solve(solver=cp.OSQP, verbose=False)
 
-def m_11_1(alpha, beta):
-    return m_matrix(alpha, beta)[10, 0]
+print("Optimisation status:", prob.status)
+print("Objective value (penalised):", prob.value)
 
-# ---------------------------------------------------------------------------
-# 4. Objectif et contraintes
-# ---------------------------------------------------------------------------
+M_opt = theta.value
 
-def objective(x):
-    diff = mean_surcharge(*x) - mu_cible
-    return diff * diff
+# --- 8. Display matrix -----------------------------------------------------
+df_M = pd.DataFrame(M_opt, index=[f"i={i+1}" for i in range(n_i)],
+                    columns=[f"j={j+1}" for j in range(n_j)])
+tools.display_dataframe_to_user("Matrice_M_spline", df_M)
 
-cons = [
-    {'type': 'ineq', 'fun': lambda x: 0.01 - m_8_10(*x)},
-    {'type': 'ineq', 'fun': lambda x: m_11_1(*x) - 0.020408}
-]
+# --- 9. 3D surface plot ----------------------------------------------------
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-# ---------------------------------------------------------------------------
-# 5. Differential Evolution (global)
-# ---------------------------------------------------------------------------
+X, Y = np.meshgrid(np.arange(1, n_j+1), np.arange(1, n_i+1))  # X=j, Y=i
 
-def penalized_obj(x):
-    if (m_8_10(*x) > 0.01) or (m_11_1(*x) < 0.020408):
-        return 1e6
-    return objective(x)
-
-res_de = differential_evolution(penalized_obj, bounds=bounds, popsize=30, maxiter=40, seed=42)
-print(f"DE: alpha≈{res_de.x[0]:.4f}, beta≈{res_de.x[1]:.4f}, obj={res_de.fun:.3e}")
-
-# ---------------------------------------------------------------------------
-# 6. SLSQP local (raffinement)
-# ---------------------------------------------------------------------------
-res_local = minimize(objective, x0=res_de.x, method='SLSQP', bounds=bounds, constraints=cons,
-                     options={'ftol': 1e-12, 'maxiter': 300})
-
-alpha_opt, beta_opt = res_local.x
-print("\n=== Solution finale ===")
-print(f"alpha* = {alpha_opt:.4f}")
-print(f"beta*  = {beta_opt:.4f}")
-print(f"moy. surcharge = {mean_surcharge(alpha_opt, beta_opt):.4%}")
-print(f"m(8,10) = {m_8_10(alpha_opt, beta_opt):.4%}")
-print(f"m(11,1) = {m_11_1(alpha_opt, beta_opt):.4%}")
-
-# ---------------------------------------------------------------------------
-# 7. Export (facultatif)
-# ---------------------------------------------------------------------------
-# m_full = m_matrix(alpha_opt, beta_opt)
-# df['factor_opt']  = 1 + m_full[i_k-1, j_k-1]
-# df['tariff_new']  = df['tariff'] * df['factor_opt']
-# df.to_csv('tariff_after_optim.csv', index=False)
+fig = plt.figure(figsize=(8, 6))
+ax = fig.add_subplot(111, projection='3d')
+ax.plot_surface(X, Y, M_opt, rstride=1, cstride=1, linewidth=0, antialiased=False)
+ax.set_xlabel("Segment conversion (j)")
+ax.set_ylabel("Segment ELR (i)")
+ax.set_zlabel("Taux de majoration")
+ax.set_title("Surface de majoration spline lissée")
+plt.tight_layout()
+plt.show()
