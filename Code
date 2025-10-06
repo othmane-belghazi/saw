@@ -1,169 +1,67 @@
-import streamlit as st
+from interpret.glassbox import ExplainableBoostingClassifier
 import numpy as np
 import pandas as pd
-import plotly.graph_objs as go
 
-st.set_page_config(page_title="Grille de surprime – 4 méthodes", layout="wide")
+# --- Features prix ---
+df['log_price'] = np.log1p(df['prix'])
 
-st.title("Grille de surprime – 4 méthodes paramétriques")
+grp = df.groupby(['Formule', 'Activité', 'TypeClient'])
+med_seg = grp['prix'].transform('median')
+q95_seg = grp['prix'].transform(lambda s: s.quantile(0.95))
 
-# -----------------------------------------------------------------------------
-# UI – Paramètres généraux
-# -----------------------------------------------------------------------------
-col1, col2, col3 = st.columns(3)
-with col1:
-    n_elr = st.number_input("Nombre de segments ELR", min_value=2, max_value=40, value=20, step=1)
-with col2:
-    n_tc = st.number_input("Nombre de segments TC", min_value=2, max_value=40, value=10, step=1)
-with col3:
-    target_margin = st.number_input("Surcharge moyenne cible (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5) / 100.0
+df['prix_rel'] = df['prix'] / med_seg - 1.0
+df['price_excess'] = (df['prix'] - q95_seg).clip(lower=0)
 
-method = st.selectbox(
-    "Méthode paramétrique", (
-        "1️⃣ Puissance (ELR, TC)",
-        "2️⃣ Suite géométrique aᶦ bʲ (index)",
-        "3️⃣ Exponentielle normalisée",
-        "4️⃣ Exponentielle saturée (tanh)"
-    )
+# Hinges optionnels
+for q in [0.7, 0.85, 0.95]:
+    q_seg = grp['prix'].transform(lambda s, qq=q: s.quantile(qq))
+    df[f'hinge_{int(q*100)}'] = (df['prix'] - q_seg).clip(lower=0)
+
+# Option B (masques par Formule), si vous ne forcez pas d'interactions :
+for f in df['Formule'].unique():
+    df[f'price_formule_{f}'] = df['prix'] * (df['Formule'] == f)
+
+# Monotonicité : -1 pour toutes les features liées au prix
+mono = {
+    'log_price': -1,
+    'prix_rel': -1,
+    'price_excess': -1,
+    'hinge_70': -1, 'hinge_85': -1, 'hinge_95': -1,
+    # + une entrée -1 pour chaque price_formule_* si vous utilisez les masques
+}
+
+# Pondération (upweight queues hautes)
+price_pct = pd.qcut(df['prix'], 10, labels=False) / 9.0
+w = 0.5 + 1.5 * price_pct
+
+features = [
+    # numériques/catégorielles existantes...
+    'PôleID', 'Formule', 'Activité', 'TypeClient', 'TypeLocal',
+    'Surface_bins', 'CA_bins', 'Capital_incendie_bins',
+    # prix
+    'log_price', 'prix_rel', 'price_excess', 'hinge_85', 'hinge_95',
+    # ou: features masquées par segment si pas d'interactions
+    # *et* retirez alors 'interactions' ci-dessous
+]
+
+ebm = ExplainableBoostingClassifier(
+    max_bins=512,
+    max_leaves=8,
+    min_samples_leaf=2,
+    outer_bags=6,
+    inner_bags=0,                 # allège le sur-lissage
+    learning_rate=0.05,
+    interactions=6,               # si vous forcez des interactions prix×segments
+    max_interaction_bins=256,
+    monotone_constraints=mono,
+    validation_size=0.1,
+    early_stopping_rounds=300,
+    n_jobs=-1,
+    random_state=42
 )
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+X = df[features]
+y = df['conversion']
+ebm.fit(X, y, sample_weight=w)
 
-def compute_k(matrix, weights, target):
-    """Calcule k pour atteindre la surcharge moyenne cible."""
-    weighted_avg = np.average(matrix, weights=weights)
-    return (1.0 + target) / weighted_avg
-
-
-def show_matrix_and_surface(M):
-    """Affiche la matrice sous forme de DataFrame et surface 3D."""
-    df = pd.DataFrame(M, index=[f"ELR {i+1}" for i in range(M.shape[0])],
-                      columns=[f"TC {j+1}" for j in range(M.shape[1])])
-    st.subheader("Matrice de surprime")
-    st.dataframe(df.style.format("{:.4f}"), use_container_width=True)
-
-    st.subheader("Surface 3D")
-    x = np.arange(M.shape[1])  # TC index
-    y = np.arange(M.shape[0])  # ELR index
-    X, Y = np.meshgrid(x, y)
-    fig = go.Figure(data=[go.Surface(z=M, x=X, y=Y, showscale=True)])
-    fig.update_layout(height=600, scene=dict(
-        xaxis_title="Index TC (j)",
-        yaxis_title="Index ELR (i)",
-        zaxis_title="Surprime"
-    ))
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# -----------------------------------------------------------------------------
-# Construction des grilles représentatives ELR / TC (ou indices)
-# -----------------------------------------------------------------------------
-
-def build_elr_values():
-    elr_min = st.number_input("ELR min (%)", min_value=0.0, max_value=200.0, value=35.0, step=1.0) / 100.0
-    elr_max = st.number_input("ELR max (%)", min_value=0.0, max_value=200.0, value=150.0, step=1.0) / 100.0
-    return np.linspace(elr_min, elr_max, n_elr)
-
-
-def build_tc_values():
-    tc_min = st.number_input("TC min (%)", min_value=0.0, max_value=100.0, value=5.0, step=1.0) / 100.0
-    tc_max = st.number_input("TC max (%)", min_value=0.0, max_value=100.0, value=40.0, step=1.0) / 100.0
-    return np.linspace(tc_min, tc_max, n_tc)
-
-
-# -----------------------------------------------------------------------------
-# Méthode 1 : puissance réelle ELR, TC
-# -----------------------------------------------------------------------------
-
-def method1(elr_vals, tc_vals):
-    st.markdown("***Paramètres méthode 1***")
-    elr_ref = st.number_input("ELR référence (%)", min_value=0.0, max_value=200.0, value=70.0, step=1.0) / 100.0
-    tc_ref = st.number_input("TC référence (%)", min_value=0.0, max_value=100.0, value=25.0, step=1.0) / 100.0
-    alpha = st.slider("α (élasticité ELR)", 0.0, 5.0, 1.0, 0.05)
-    beta = st.slider("β (élasticité TC)", 0.0, 5.0, 1.0, 0.05)
-
-    M0 = np.outer((elr_vals / elr_ref) ** alpha, (tc_vals / tc_ref) ** beta)
-    return M0
-
-
-# -----------------------------------------------------------------------------
-# Méthode 2 : suites géométriques index
-# -----------------------------------------------------------------------------
-
-def method2():
-    st.markdown("***Paramètres méthode 2***")
-    r_elr = st.slider("Multiplicateur total ELR (ratio extrémités)", 1.0, 20.0, 5.0, 0.1)
-    r_tc = st.slider("Multiplicateur total TC (ratio extrémités)", 1.0, 20.0, 5.0, 0.1)
-
-    a = r_elr ** (1 / (n_elr - 1))
-    b = r_tc ** (1 / (n_tc - 1))
-
-    M0 = np.outer(a ** np.arange(n_elr), b ** np.arange(n_tc))
-    return M0
-
-
-# -----------------------------------------------------------------------------
-# Méthode 3 : exponentielle normalisée
-# -----------------------------------------------------------------------------
-
-def method3():
-    st.markdown("***Paramètres méthode 3***")
-    alpha = st.slider("α", 0.0, 10.0, 5.0, 0.1)
-    beta = st.slider("β", 0.0, 10.0, 5.0, 0.1)
-
-    u = (np.arange(n_elr) + 0.5) / n_elr
-    v = (np.arange(n_tc) + 0.5) / n_tc
-
-    M0 = np.exp(np.outer(u * alpha, np.ones(n_tc)) + np.outer(np.ones(n_elr), v * beta))
-    return M0
-
-
-# -----------------------------------------------------------------------------
-# Méthode 4 : exponentielle saturée (tanh)
-# -----------------------------------------------------------------------------
-
-def method4():
-    st.markdown("***Paramètres méthode 4***")
-    alpha = st.slider("α", 0.0, 10.0, 5.0, 0.1)
-    beta = st.slider("β", 0.0, 10.0, 5.0, 0.1)
-    gamma = st.slider("γ (plafond)", 0.1, 10.0, 3.0, 0.1)
-
-    u = (np.arange(n_elr) + 0.5) / n_elr
-    v = (np.arange(n_tc) + 0.5) / n_tc
-
-    S = np.outer(u * alpha, np.ones(n_tc)) + np.outer(np.ones(n_elr), v * beta)
-    M0 = np.exp(gamma * np.tanh(S))
-    return M0
-
-
-# -----------------------------------------------------------------------------
-# Calcul principal
-# -----------------------------------------------------------------------------
-
-def main():
-    if method.startswith("1"):
-        elr_vals = build_elr_values()
-        tc_vals = build_tc_values()
-        M0 = method1(elr_vals, tc_vals)
-    elif method.startswith("2"):
-        M0 = method2()
-    elif method.startswith("3"):
-        M0 = method3()
-    else:
-        M0 = method4()
-
-    # Poids uniformes par défaut (peuvent être remplacés par un upload CSV par ex.)
-    weights = np.ones_like(M0)
-
-    k = compute_k(M0, weights, target_margin)
-    M = k * M0
-
-    st.success(f"Paramètre k calculé : {k:.6f} – Surcharge moyenne = {(M * weights).mean() - 1:.2%}")
-
-    show_matrix_and_surface(M)
-
-
-if __name__ == "__main__":
-    main()
+# Après entraînement : contrôles d'élasticité / monotonicité / ICE
