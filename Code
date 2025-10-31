@@ -1,67 +1,190 @@
-from interpret.glassbox import ExplainableBoostingClassifier
-import numpy as np
 import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+from interpret.glassbox import ExplainableBoostingClassifier
+from sklearn.model_selection import train_test_split
+import warnings
 
-# --- Features prix ---
-df['log_price'] = np.log1p(df['prix'])
+# ignorer les avertissements pour une sortie plus propre
+warnings.filterwarnings('ignore')
 
-grp = df.groupby(['Formule', 'Activité', 'TypeClient'])
-med_seg = grp['prix'].transform('median')
-q95_seg = grp['prix'].transform(lambda s: s.quantile(0.95))
+print("--- 1. préparation : imports et création des données fictives ---")
 
-df['prix_rel'] = df['prix'] / med_seg - 1.0
-df['price_excess'] = (df['prix'] - q95_seg).clip(lower=0)
+# --- création d'un jeu de données (df) fictif ---
+# (vous remplacerez cette partie par le chargement de vos données)
+n_activites = 5
+contrats_par_activite = 20
+total_contrats = n_activites * contrats_par_activite
 
-# Hinges optionnels
-for q in [0.7, 0.85, 0.95]:
-    q_seg = grp['prix'].transform(lambda s, qq=q: s.quantile(qq))
-    df[f'hinge_{int(q*100)}'] = (df['prix'] - q_seg).clip(lower=0)
+def generer_dataset_fictif():
+    df = pd.DataFrame({
+        'id_contrat': range(total_contrats),
+        'activite': [f'act_{i+1}' for i in range(n_activites) for _ in range(contrats_par_activite)],
+        'pp': np.random.uniform(100, 500, total_contrats) * (np.repeat([1, 1.5, 0.8, 2.0, 1.2], contrats_par_activite)),
+        'ca_binned': np.random.choice(['tpe', 'pme'], total_contrats)
+    })
+    
+    # supposer une majoration initiale plate de 15% pour créer le pc initial
+    df['pc_initiale'] = df['pp'] * 1.15
+    
+    # simuler une conversion (0/1) pour l'entraînement de l'ebm
+    # (plus le prix est élevé, moins la conversion est probable)
+    prob = 0.8 - (df['pc_initiale'] / df['pc_initiale'].max()) * 0.7
+    df['conversion'] = (np.random.rand(total_contrats) < prob).astype(int)
+    
+    return df
 
-# Option B (masques par Formule), si vous ne forcez pas d'interactions :
-for f in df['Formule'].unique():
-    df[f'price_formule_{f}'] = df['prix'] * (df['Formule'] == f)
+df = generer_dataset_fictif()
 
-# Monotonicité : -1 pour toutes les features liées au prix
-mono = {
-    'log_price': -1,
-    'prix_rel': -1,
-    'price_excess': -1,
-    'hinge_70': -1, 'hinge_85': -1, 'hinge_95': -1,
-    # + une entrée -1 pour chaque price_formule_* si vous utilisez les masques
-}
+# --- entraînement d'un modèle ebm fictif ---
+# (vous remplacerez cette partie par le chargement de votre modèle entraîné)
 
-# Pondération (upweight queues hautes)
-price_pct = pd.qcut(df['prix'], 10, labels=False) / 9.0
-w = 0.5 + 1.5 * price_pct
+print("entraînement du modèle ebm fictif...")
+# le modèle apprend à prédire la 'conversion' en utilisant le prix initial et le risque
+features = ['pc_initiale', 'activite', 'ca_binned']
+target = 'conversion'
 
-features = [
-    # numériques/catégorielles existantes...
-    'PôleID', 'Formule', 'Activité', 'TypeClient', 'TypeLocal',
-    'Surface_bins', 'CA_bins', 'Capital_incendie_bins',
-    # prix
-    'log_price', 'prix_rel', 'price_excess', 'hinge_85', 'hinge_95',
-    # ou: features masquées par segment si pas d'interactions
-    # *et* retirez alors 'interactions' ci-dessous
-]
+# convertir les catégories pour l'ebm
+for col in ['activite', 'ca_binned']:
+    df[col] = df[col].astype('category')
 
-ebm = ExplainableBoostingClassifier(
-    max_bins=512,
-    max_leaves=8,
-    min_samples_leaf=2,
-    outer_bags=6,
-    inner_bags=0,                 # allège le sur-lissage
-    learning_rate=0.05,
-    interactions=6,               # si vous forcez des interactions prix×segments
-    max_interaction_bins=256,
-    monotone_constraints=mono,
-    validation_size=0.1,
-    early_stopping_rounds=300,
-    n_jobs=-1,
-    random_state=42
+x_train = df[features]
+y_train = df[target]
+
+modele_ebm = ExplainableBoostingClassifier(
+    monotonicity={'pc_initiale': 'decreasing'},
+    interactions=0 # simple pour cet exemple
+)
+modele_ebm.fit(x_train, y_train)
+
+print("données et modèle prêts.")
+print(df.head())
+
+
+print("\n--- 2. calcul des cibles d'optimisation (volume initial) ---")
+
+def preparer_cibles(df, ebm_model):
+    # prédire la probabilité de conversion sur les données initiales
+    df['f_ij_initial'] = ebm_model.predict_proba(df[features])[:, 1]
+    
+    # agréger par activité pour obtenir le volume initial
+    df_agg_initial = df.groupby('activite').agg(
+        e_n_initial=('f_ij_initial', 'sum')
+    )
+    
+    # définir la cible (95% du volume initial)
+    df_agg_initial['cible_volume_i'] = df_agg_initial['e_n_initial'] * 0.95
+    
+    # fusionner cette cible dans le dataframe principal
+    df = pd.merge(df, df_agg_initial[['cible_volume_i']], on='activite')
+    
+    print("cibles de volume calculées :")
+    print(df_agg_initial)
+    return df
+
+df_avec_cibles = preparer_cibles(df, modele_ebm)
+
+
+print("\n--- 3. définition de la fonction d'optimisation ---")
+
+def fonction_objectif(x, df_base, ebm, elr_cible_globale, lambda_elr, lambda_vol):
+    """
+    calcule le score global (négatif) pour un vecteur de majorations x.
+    """
+    
+    # x est un array [x1, x2, x3, x4, x5]
+    
+    # 1. mapper le vecteur x aux activités dans le dataframe
+    map_activite_x = {f'act_{i+1}': x[i] for i in range(len(x))}
+    df = df_base.copy()
+    df['x_i'] = df['activite'].map(map_activite_x)
+    
+    # 2. calculer la *nouvelle* prime commerciale
+    df['pc_nouvelle'] = df['pp'] * (1 + df['x_i'])
+    
+    # 3. préparer le dataframe pour la prédiction ebm
+    # (les colonnes doivent correspondre à l'entraînement !)
+    x_predict = df[['pc_nouvelle', 'activite', 'ca_binned']]
+    x_predict = x_predict.rename(columns={'pc_nouvelle': 'pc_initiale'})
+    
+    # 4. prédire les nouvelles probabilités f_ij(x_i)
+    df['f_ij'] = ebm.predict_proba(x_predict)[:, 1]
+    
+    # 5. calculer les espérances (coût, revenu, volume)
+    df['e_pp'] = df['pp'] * df['f_ij'] # coût attendu
+    df['e_pc'] = df['pc_nouvelle'] * df['f_ij'] # revenu attendu (gwp)
+    
+    # 6. agréger par activité
+    df_agg = df.groupby('activite').agg(
+        e_pp_sum=('e_pp', 'sum'),
+        e_pc_sum=('e_pc', 'sum'),
+        e_n_sum=('f_ij', 'sum'),
+        cible_volume_i=('cible_volume_i', 'first')
+    )
+    
+    # --- calcul du score ---
+    
+    # partie 1 : gwp global (ce qu'on maximise)
+    gwp_total = df_agg['e_pc_sum'].sum()
+    
+    # partie 2 : pénalité elr
+    df_agg['elr_actuel'] = df_agg['e_pp_sum'] / (df_agg['e_pc_sum'] + 1e-6)
+    depassement_elr = (df_agg['elr_actuel'] - elr_cible_globale).clip(lower=0)
+    penalite_elr_ponderee = (depassement_elr * df_agg['e_pp_sum']).sum()
+    
+    # partie 3 : pénalité volume
+    manque_volume = (df_agg['cible_volume_i'] - df_agg['e_n_sum']).clip(lower=0)
+    penalite_volume = manque_volume.sum()
+    
+    # --- score final ---
+    score = gwp_total - (lambda_elr * penalite_elr_ponderee) - (lambda_vol * penalite_volume)
+    
+    # nous devons *minimiser* le score *négatif* pour le maximiser
+    return -score
+
+print("fonction objectif définie.")
+
+print("\n--- 4. exécution de l'optimisation ---")
+
+# --- nos paramètres de pilotage ---
+elr_cible_globale = 0.75  # 75%
+lambda_elr = 100.0         # poids élevé pour la pénalité elr
+lambda_vol = 500.0         # poids très élevé pour la pénalité volume
+
+# --- contraintes "dures" (bounds) ---
+n_activites = df['activite'].nunique()
+# majorations autorisées entre -10% et +40%
+bounds = [(-0.1, 0.4)] * n_activites
+
+# point de départ (0% de majoration)
+x_initial = np.zeros(n_activites)
+
+# figer les arguments de la fonction objectif
+args = (df_avec_cibles, modele_ebm, elr_cible_globale, lambda_elr, lambda_vol)
+
+# --- lancement du solveur ---
+resultat = minimize(
+    fonction_objectif,
+    x_initial,
+    args=args,
+    method='slsqp',
+    bounds=bounds,
+    options={'disp': true, 'maxiter': 200}
 )
 
-X = df[features]
-y = df['conversion']
-ebm.fit(X, y, sample_weight=w)
-
-# Après entraînement : contrôles d'élasticité / monotonicité / ICE
+# --- affichage des résultats ---
+if resultat.success:
+    print("\n--- 5. résultats (majorations optimales x_i) ---")
+    majorations_optimales = resultat.x
+    
+    df_resultats = pd.dataframe({
+        'activite': [f'act_{i+1}' for i in range(n_activites)],
+        'majoration_optimale_x_i': majorations_optimales
+    })
+    df_resultats['majoration_optimale_x_i'] = (df_resultats['majoration_optimale_x_i'] * 100).round(2).astype(str) + ' %'
+    print(df_resultats)
+    
+    score_final = -resultat.fun
+    print(f"\nscore global (gwp pénalisé) atteint : {score_final:,.2f} €")
+else:
+    print(f"\n--- l'optimiseur a échoué : {resultat.message} ---")
