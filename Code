@@ -1,190 +1,168 @@
-import pandas as pd
+# %% [markdown]
+# 🟢 1. Imports et paramètres globaux
+
 import numpy as np
-from scipy.optimize import minimize
-from interpret.glassbox import ExplainableBoostingClassifier
-from sklearn.model_selection import train_test_split
-import warnings
+import pandas as pd
+from scipy.optimize import differential_evolution
+from functools import partial
 
-# ignorer les avertissements pour une sortie plus propre
-warnings.filterwarnings('ignore')
+# paramètres à ajuster
+lambda_elr = 1.0
+lambda_vol = 1.0
+x_min, x_max = 0.0, 0.08
+max_iter = 60
+random_state = 42
 
-print("--- 1. préparation : imports et création des données fictives ---")
+# si le modèle EBM est déjà chargé :
+# import pickle
+# with open('ebm_model.pkl','rb') as f:
+#     ebm_model = pickle.load(f)
 
-# --- création d'un jeu de données (df) fictif ---
-# (vous remplacerez cette partie par le chargement de vos données)
-n_activites = 5
-contrats_par_activite = 20
-total_contrats = n_activites * contrats_par_activite
 
-def generer_dataset_fictif():
-    df = pd.DataFrame({
-        'id_contrat': range(total_contrats),
-        'activite': [f'act_{i+1}' for i in range(n_activites) for _ in range(contrats_par_activite)],
-        'pp': np.random.uniform(100, 500, total_contrats) * (np.repeat([1, 1.5, 0.8, 2.0, 1.2], contrats_par_activite)),
-        'ca_binned': np.random.choice(['tpe', 'pme'], total_contrats)
-    })
+# %% [markdown]
+# 🟢 2. Vérification de la donnée de base `df`
+
+cols_requis = ['numcontrat','activity_code','PC','PP','surface','type_client','local','chiffre_affaires']
+if 'df' not in globals():
+    raise RuntimeError("⚠️ La DataFrame 'df' doit être déjà chargée en mémoire.")
+if any(c not in df.columns for c in cols_requis):
+    raise RuntimeError(f"Colonnes manquantes : {set(cols_requis) - set(df.columns)}")
+
+# liste des activités
+activites = sorted(df['activity_code'].unique().tolist())
+n = len(activites)
+
+# regroupement par activité
+df_act = {act: df[df['activity_code'] == act].reset_index(drop=True) for act in activites}
+
+##############################
+
+
+# %% [markdown]
+# 🟢 3. Calcul des valeurs initiales : ELR global et volumes initiaux
+
+gwp_tot = 0
+pp_tot = 0
+elr_par_act = {}
+n_init = {}
+
+for act in activites:
+    data = df_act[act].copy()
+    f0 = ebm_model.predict_proba(data)[:,1]
+    f0 = np.clip(f0,0,1)
+    pc = data['PC'].values
+    pp = data['PP'].values
     
-    # supposer une majoration initiale plate de 15% pour créer le pc initial
-    df['pc_initiale'] = df['pp'] * 1.15
+    gwp_i = np.sum(pc * f0)
+    pp_i = np.sum(pp * f0)
+    n_i = np.sum(f0)
     
-    # simuler une conversion (0/1) pour l'entraînement de l'ebm
-    # (plus le prix est élevé, moins la conversion est probable)
-    prob = 0.8 - (df['pc_initiale'] / df['pc_initiale'].max()) * 0.7
-    df['conversion'] = (np.random.rand(total_contrats) < prob).astype(int)
+    gwp_tot += gwp_i
+    pp_tot += pp_i
+    elr_par_act[act] = pp_i / gwp_i if gwp_i>0 else np.inf
+    n_init[act] = n_i
+
+elr_global = pp_tot / gwp_tot
+print(f"ELR produit global initial : {elr_global:.4f}")
+
+
+
+# %% [markdown]
+# 🟢 4. Fonction objectif S(X) sans utiliser def (écrite inline dans la boucle d'optimisation)
+
+# on crée une fonction lambda pour differential_evolution
+# cette fonction calcule -S(X) (car l'algo minimise)
+
+def objectif(x_vect):
+    total_gwp = 0
+    pen_elr = 0
+    pen_vol = 0
     
-    return df
-
-df = generer_dataset_fictif()
-
-# --- entraînement d'un modèle ebm fictif ---
-# (vous remplacerez cette partie par le chargement de votre modèle entraîné)
-
-print("entraînement du modèle ebm fictif...")
-# le modèle apprend à prédire la 'conversion' en utilisant le prix initial et le risque
-features = ['pc_initiale', 'activite', 'ca_binned']
-target = 'conversion'
-
-# convertir les catégories pour l'ebm
-for col in ['activite', 'ca_binned']:
-    df[col] = df[col].astype('category')
-
-x_train = df[features]
-y_train = df[target]
-
-modele_ebm = ExplainableBoostingClassifier(
-    monotonicity={'pc_initiale': 'decreasing'},
-    interactions=0 # simple pour cet exemple
-)
-modele_ebm.fit(x_train, y_train)
-
-print("données et modèle prêts.")
-print(df.head())
-
-
-print("\n--- 2. calcul des cibles d'optimisation (volume initial) ---")
-
-def preparer_cibles(df, ebm_model):
-    # prédire la probabilité de conversion sur les données initiales
-    df['f_ij_initial'] = ebm_model.predict_proba(df[features])[:, 1]
+    for idx, act in enumerate(activites):
+        x_i = float(x_vect[idx])
+        data = df_act[act].copy()
+        
+        # appliquer majoration sur la prime
+        data['PC_mod'] = data['PC'] * (1 + x_i)
+        f = ebm_model.predict_proba(data)[:,1]
+        f = np.clip(f,0,1)
+        
+        pc = data['PC_mod'].values
+        pp = data['PP'].values
+        
+        gwp_i = np.sum(pc * f)
+        pp_i = np.sum(pp * f)
+        n_i = np.sum(f)
+        
+        elr_i = pp_i / gwp_i if gwp_i>0 else np.inf
+        
+        total_gwp += gwp_i
+        
+        # pénalisation ELR
+        depassement = max(0, elr_i - elr_global)
+        pen_elr += depassement * gwp_i
+        
+        # pénalisation volume
+        seuil = 0.95 * n_init[act]
+        pen_vol += max(0, seuil - n_i)
     
-    # agréger par activité pour obtenir le volume initial
-    df_agg_initial = df.groupby('activite').agg(
-        e_n_initial=('f_ij_initial', 'sum')
-    )
-    
-    # définir la cible (95% du volume initial)
-    df_agg_initial['cible_volume_i'] = df_agg_initial['e_n_initial'] * 0.95
-    
-    # fusionner cette cible dans le dataframe principal
-    df = pd.merge(df, df_agg_initial[['cible_volume_i']], on='activite')
-    
-    print("cibles de volume calculées :")
-    print(df_agg_initial)
-    return df
-
-df_avec_cibles = preparer_cibles(df, modele_ebm)
+    s = total_gwp - lambda_elr*pen_elr - lambda_vol*pen_vol
+    return -s  # on minimise -S
 
 
-print("\n--- 3. définition de la fonction d'optimisation ---")
 
-def fonction_objectif(x, df_base, ebm, elr_cible_globale, lambda_elr, lambda_vol):
-    """
-    calcule le score global (négatif) pour un vecteur de majorations x.
-    """
-    
-    # x est un array [x1, x2, x3, x4, x5]
-    
-    # 1. mapper le vecteur x aux activités dans le dataframe
-    map_activite_x = {f'act_{i+1}': x[i] for i in range(len(x))}
-    df = df_base.copy()
-    df['x_i'] = df['activite'].map(map_activite_x)
-    
-    # 2. calculer la *nouvelle* prime commerciale
-    df['pc_nouvelle'] = df['pp'] * (1 + df['x_i'])
-    
-    # 3. préparer le dataframe pour la prédiction ebm
-    # (les colonnes doivent correspondre à l'entraînement !)
-    x_predict = df[['pc_nouvelle', 'activite', 'ca_binned']]
-    x_predict = x_predict.rename(columns={'pc_nouvelle': 'pc_initiale'})
-    
-    # 4. prédire les nouvelles probabilités f_ij(x_i)
-    df['f_ij'] = ebm.predict_proba(x_predict)[:, 1]
-    
-    # 5. calculer les espérances (coût, revenu, volume)
-    df['e_pp'] = df['pp'] * df['f_ij'] # coût attendu
-    df['e_pc'] = df['pc_nouvelle'] * df['f_ij'] # revenu attendu (gwp)
-    
-    # 6. agréger par activité
-    df_agg = df.groupby('activite').agg(
-        e_pp_sum=('e_pp', 'sum'),
-        e_pc_sum=('e_pc', 'sum'),
-        e_n_sum=('f_ij', 'sum'),
-        cible_volume_i=('cible_volume_i', 'first')
-    )
-    
-    # --- calcul du score ---
-    
-    # partie 1 : gwp global (ce qu'on maximise)
-    gwp_total = df_agg['e_pc_sum'].sum()
-    
-    # partie 2 : pénalité elr
-    df_agg['elr_actuel'] = df_agg['e_pp_sum'] / (df_agg['e_pc_sum'] + 1e-6)
-    depassement_elr = (df_agg['elr_actuel'] - elr_cible_globale).clip(lower=0)
-    penalite_elr_ponderee = (depassement_elr * df_agg['e_pp_sum']).sum()
-    
-    # partie 3 : pénalité volume
-    manque_volume = (df_agg['cible_volume_i'] - df_agg['e_n_sum']).clip(lower=0)
-    penalite_volume = manque_volume.sum()
-    
-    # --- score final ---
-    score = gwp_total - (lambda_elr * penalite_elr_ponderee) - (lambda_vol * penalite_volume)
-    
-    # nous devons *minimiser* le score *négatif* pour le maximiser
-    return -score
 
-print("fonction objectif définie.")
 
-print("\n--- 4. exécution de l'optimisation ---")
+# %% [markdown]
+# 🟢 5. Lancement de l'optimisation
 
-# --- nos paramètres de pilotage ---
-elr_cible_globale = 0.75  # 75%
-lambda_elr = 100.0         # poids élevé pour la pénalité elr
-lambda_vol = 500.0         # poids très élevé pour la pénalité volume
+bornes = [(x_min, x_max) for _ in range(n)]
 
-# --- contraintes "dures" (bounds) ---
-n_activites = df['activite'].nunique()
-# majorations autorisées entre -10% et +40%
-bounds = [(-0.1, 0.4)] * n_activites
-
-# point de départ (0% de majoration)
-x_initial = np.zeros(n_activites)
-
-# figer les arguments de la fonction objectif
-args = (df_avec_cibles, modele_ebm, elr_cible_globale, lambda_elr, lambda_vol)
-
-# --- lancement du solveur ---
-resultat = minimize(
-    fonction_objectif,
-    x_initial,
-    args=args,
-    method='slsqp',
-    bounds=bounds,
-    options={'disp': true, 'maxiter': 200}
+resultat = differential_evolution(
+    objectif,
+    bounds=bornes,
+    maxiter=max_iter,
+    seed=random_state,
+    polish=True
 )
 
-# --- affichage des résultats ---
-if resultat.success:
-    print("\n--- 5. résultats (majorations optimales x_i) ---")
-    majorations_optimales = resultat.x
+x_opt = resultat.x
+print("✅ Optimisation terminée.")
+print(f"Score objectif : {-resultat.fun:.2f}")
+print("Majorations optimales par activité :")
+for act, x in zip(activites, x_opt):
+    print(f"  {act} → {x*100:.2f}%")
+
+
+
+
+# %% [markdown]
+# 🟢 6. Calcul des indicateurs finaux par activité après optimisation
+
+res = []
+for idx, act in enumerate(activites):
+    x_i = float(x_opt[idx])
+    data = df_act[act].copy()
+    data['PC_mod'] = data['PC'] * (1 + x_i)
+    f = ebm_model.predict_proba(data)[:,1]
+    f = np.clip(f,0,1)
     
-    df_resultats = pd.dataframe({
-        'activite': [f'act_{i+1}' for i in range(n_activites)],
-        'majoration_optimale_x_i': majorations_optimales
+    gwp_i = np.sum(data['PC_mod'] * f)
+    pp_i = np.sum(data['PP'] * f)
+    n_i = np.sum(f)
+    elr_i = pp_i / gwp_i if gwp_i>0 else np.inf
+    
+    res.append({
+        'activity_code': act,
+        'x_i': x_i,
+        'gwp_i': gwp_i,
+        'pp_i': pp_i,
+        'n_i': n_i,
+        'elr_i': elr_i
     })
-    df_resultats['majoration_optimale_x_i'] = (df_resultats['majoration_optimale_x_i'] * 100).round(2).astype(str) + ' %'
-    print(df_resultats)
-    
-    score_final = -resultat.fun
-    print(f"\nscore global (gwp pénalisé) atteint : {score_final:,.2f} €")
-else:
-    print(f"\n--- l'optimiseur a échoué : {resultat.message} ---")
+
+df_res = pd.DataFrame(res).sort_values('activity_code').reset_index(drop=True)
+display(df_res)
+print(f"GWP total optimisé : {df_res['gwp_i'].sum():.2f}")
+
+
