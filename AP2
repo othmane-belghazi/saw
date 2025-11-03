@@ -1,0 +1,121 @@
+# ---------------------------------------------------------
+# Approche 2 : Avec conversion (EBM), volume global uniquement
+# Objectif : rapprocher ELR global de tau + ordre des hausses
+# ---------------------------------------------------------
+def _ebm_predict_prob(ebm_model, X):
+    proba = np.asarray(ebm_model.predict_proba(X))
+    if proba.ndim == 2 and proba.shape[1] >= 2:
+        return np.clip(proba[:, 1], 0.0, 1.0)
+    return np.clip(proba.reshape(-1), 0.0, 1.0)
+
+def _precompute_grid_with_ebm(df, ebm_model, s_levels):
+    """Calcule N_i^k, R_i^k, C_i^k + baselines pondérées EBM pour l'ordre."""
+    activities = sorted(df['activite'].unique().tolist())
+    K = len(s_levels)
+    N_ik, R_ik, C_ik = {}, {}, {}
+
+    # Baseline (s=0) pour ordre + N0_tot
+    X0 = pd.DataFrame({
+        'prime_commerciale': df['prime_commerciale'].astype(float),
+        'surafce': df['surafce'],
+        'CA': df['CA'],
+        'type_client': df['type_client'],
+        'reduction': df['reduction'].astype(float),
+    })
+    p0 = _ebm_predict_prob(ebm_model, X0)
+    df0 = df.assign(p0=p0)
+    N0_by_act = df0.groupby('activite')['p0'].sum()
+    R0_by_act = (df0['p0'] * df0['prime_commerciale']).groupby(df0['activite']).sum()
+    C0_by_act = (df0['p0'] * df0['prime_pure']).groupby(df0['activite']).sum()
+    ELR0_by_act = (C0_by_act / R0_by_act.replace(0.0, np.nan)).fillna(0.0)
+    N0_tot = float(N0_by_act.sum())
+
+    for k, s in enumerate(s_levels):
+        PC_new = df['prime_commerciale'].astype(float) * (1.0 + s)
+        Xk = pd.DataFrame({
+            'prime_commerciale': PC_new,
+            'surafce': df['surafce'],
+            'CA': df['CA'],
+            'type_client': df['type_client'],
+            'reduction': df['reduction'].astype(float),
+        })
+        p = _ebm_predict_prob(ebm_model, Xk)
+        tmp = pd.DataFrame({'activite': df['activite'], 'p': p, 'PC_new': PC_new, 'PP': df['prime_pure'].astype(float)})
+        N_k = tmp.groupby('activite')['p'].sum()
+        R_k = (tmp['p'] * tmp['PC_new']).groupby(tmp['activite']).sum()
+        C_k = (tmp['p'] * tmp['PP']).groupby(tmp['activite']).sum()
+        for a in activities:
+            N_ik[(a, k)] = float(N_k.get(a, 0.0))
+            R_ik[(a, k)] = float(R_k.get(a, 0.0))
+            C_ik[(a, k)] = float(C_k.get(a, 0.0))
+
+    return activities, N_ik, R_ik, C_ik, N0_by_act, N0_tot, ELR0_by_act
+
+def optimize_approach2(df, ebm_model,
+                       tau=None,
+                       step=0.005, s_max=0.08,
+                       alpha_total=0.97,
+                       delta_order=0.0):   # 0.0 = non strict ; ex 0.002 strict
+    # Grille
+    s_levels = np.round(np.arange(0.0, s_max + 1e-12, step), 6)
+    activities, N_ik, R_ik, C_ik, N0_by_act, N0_tot, ELR0_by_act = _precompute_grid_with_ebm(df, ebm_model, s_levels)
+    K = len(s_levels)
+
+    # Cible tau par défaut (constante business)
+    if tau is None:
+        tau = float(df['prime_pure'].sum() / df['prime_commerciale'].sum())
+
+    # MILP
+    m = pulp.LpProblem("A2_MinELRGap_WithConversion_GlobalVolume", pulp.LpMinimize)
+    x = {(a, k): pulp.LpVariable(f"x_{a}_{k}", lowBound=0, upBound=1, cat="Binary")
+         for a in activities for k in range(K)}
+    t = pulp.LpVariable("t_abs_dev", lowBound=0)
+
+    # Objectif
+    m += t
+
+    # Un palier par activité
+    for a in activities:
+        m += pulp.lpSum(x[(a, k)] for k in range(K)) == 1
+
+    # Expressions globales
+    R_tot = pulp.lpSum(x[(a, k)] * R_ik[(a, k)] for a in activities for k in range(K))
+    C_tot = pulp.lpSum(x[(a, k)] * C_ik[(a, k)] for a in activities for k in range(K))
+    N_tot = pulp.lpSum(x[(a, k)] * N_ik[(a, k)] for a in activities for k in range(K))
+
+    # |C - tau R| <= t
+    m += C_tot - tau * R_tot <= t
+    m += tau * R_tot - C_tot <= t
+
+    # Volume global
+    m += N_tot >= alpha_total * float(N0_tot)
+
+    # Ordre des hausses (adjacent en ELR0)
+    ord_acts = sorted(activities, key=lambda a: float(ELR0_by_act[a]))
+    for u, v in zip(ord_acts, ord_acts[1:]):
+        m += pulp.lpSum(s_levels[k] * x[(u, k)] for k in range(K)) + delta_order \
+             <= pulp.lpSum(s_levels[k] * x[(v, k)] for k in range(K))
+
+    # Solve
+    status = m.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] not in ("Optimal", "Feasible"):
+        raise RuntimeError(f"Approche 2 infaisable : {pulp.LpStatus[status]} (essaie de baisser alpha_total ou delta_order).")
+
+    # Résultats
+    rows = []
+    R_val = float(pulp.value(R_tot))
+    C_val = float(pulp.value(C_tot))
+    ELR_tot = (C_val / R_val) if R_val > 0 else 0.0
+
+    for a in activities:
+        k_star = max(range(K), key=lambda k: float(pulp.value(x[(a, k)]) or 0.0))
+        rows.append({"activite": a,
+                     "ELR0_pond": float(ELR0_by_act[a]),
+                     "s_opt": float(s_levels[k_star])})
+    res = pd.DataFrame(rows).sort_values(["s_opt","activite"]).reset_index(drop=True)
+    summary = {"tau_cible": float(tau),
+               "ELR_tot_opt": float(ELR_tot),
+               "abs_ecart": abs(float(C_val - tau * R_val)),
+               "N0_tot": float(N0_tot),
+               "N_tot_opt": float(pulp.value(N_tot))}
+    return res, summary
