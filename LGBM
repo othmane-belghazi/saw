@@ -1,0 +1,228 @@
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+# === Paramètres ===
+target_col = "conversion"   # <-- ⚠️ mettez ici le nom de votre cible binaire (0/1)
+
+# Colonnes (on n'utilise QUE la prime du contrat, pas de prix par activité)
+num_cols = ["log_price", "surafce", "CA", "reduction"]
+cat_cols = ["type_client", "activite"]   # gardées comme catégorielles
+use_cols = num_cols + cat_cols
+
+# Vérification minimale de présence (ne crée ni ne modifie votre df)
+required_cols = set(["prime_commerciale", target_col, "surafce", "CA", "reduction", "type_client", "activite"])
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"Colonnes manquantes dans df: {missing}")
+
+# On travaille sur une copie locale
+df = df.copy()
+
+
+
+
+# === Feature prix contractuelle ===
+# Monotonicité sur log(prime_commerciale)
+df["log_price"] = np.log(df["prime_commerciale"].astype(float).clip(lower=1e-9))
+
+# Cast catégoriels pour LightGBM
+for c in cat_cols:
+    df[c] = df[c].astype("category")
+
+# Découpe : 60% train / 20% valid / 10% calib / 10% test
+df_train, df_temp = train_test_split(df, test_size=0.4, random_state=42, stratify=df[target_col])
+df_valid, df_caltest = train_test_split(df_temp, test_size=0.5, random_state=42, stratify=df_temp[target_col])
+df_cal, df_test = train_test_split(df_caltest, test_size=0.5, random_state=42, stratify=df_caltest[target_col])
+
+def make_Xy(dframe):
+    X = dframe[use_cols].copy()
+    y = dframe[target_col].astype(int).values
+    return X, y
+
+X_train, y_train = make_Xy(df_train)
+X_valid, y_valid = make_Xy(df_valid)
+X_cal,   y_cal   = make_Xy(df_cal)
+X_test,  y_test  = make_Xy(df_test)
+
+print(f"Tailles => train={len(X_train)}, valid={len(X_valid)}, calib={len(X_cal)}, test={len(X_test)}")
+
+
+
+
+# Monotonicité : -1 pour log_price (décroissant), 0 pour les autres numériques, 0 pour les catégorielles
+monotone_constraints = [-1] + [0]*(len(num_cols)-1) + [0]*len(cat_cols)
+assert len(monotone_constraints) == len(use_cols)
+
+lgb_clf = lgb.LGBMClassifier(
+    objective="binary",
+    n_estimators=5000,
+    learning_rate=0.03,
+    num_leaves=64,
+    min_child_samples=200,
+    subsample=0.9,
+    colsample_bytree=0.8,
+    reg_lambda=10.0,
+    monotone_constraints=monotone_constraints,
+    random_state=42
+)
+
+lgb_clf.fit(
+    X_train, y_train,
+    eval_set=[(X_valid, y_valid)],
+    eval_metric="binary_logloss",
+    early_stopping_rounds=300,
+    categorical_feature=cat_cols,
+    verbose=False
+)
+
+print(f"Best iteration: {lgb_clf.best_iteration_}")
+
+
+
+# Calibration isotone sur un set dédié (cv='prefit' : on fournit un modèle déjà entraîné)
+calibrated_clf = CalibratedClassifierCV(
+    base_estimator=lgb_clf,
+    method="isotonic",
+    cv="prefit"
+)
+calibrated_clf.fit(X_cal, y_cal)
+print("Calibration isotone entraînée.")
+
+
+def expected_calibration_error(y_true, y_prob, n_bins=20):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    bins = np.linspace(0.0, 1.0, n_bins+1)
+    ece = 0.0
+    m = len(y_true)
+    for b in range(n_bins):
+        lo, hi = bins[b], bins[b+1]
+        mask = (y_prob >= lo) & (y_prob < hi) if b < n_bins-1 else (y_prob >= lo) & (y_prob <= hi)
+        if not np.any(mask):
+            continue
+        p_bin = y_prob[mask].mean()
+        y_bin = y_true[mask].mean()
+        w_bin = mask.mean()  # proportion
+        ece += np.abs(p_bin - y_bin) * w_bin
+    return ece
+
+# Probabilités calibrées (TEST)
+proba_test = calibrated_clf.predict_proba(X_test)[:, 1]
+auc   = roc_auc_score(y_test, proba_test)
+brier = brier_score_loss(y_test, proba_test)
+ll    = log_loss(y_test, proba_test, eps=1e-15)
+ece   = expected_calibration_error(y_test, proba_test, n_bins=20)
+
+print(f"AUC               : {auc:.4f}")
+print(f"Brier             : {brier:.4f}")
+print(f"LogLoss           : {ll:.4f}")
+print(f"ECE (20 bins)     : {ece:.4f}")
+
+# (Optionnel) Courbe de fiabilité simple
+# Bin par probabilité, moyenne observée vs prédite
+bins = np.linspace(0,1,11)
+digit = np.digitize(proba_test, bins) - 1
+df_curve = pd.DataFrame({"y": y_test, "p": proba_test, "bin": digit})
+cal_curve = df_curve.groupby("bin").agg(y_mean=("y","mean"), p_mean=("p","mean"), n=("y","size")).reset_index()
+
+plt.figure()
+plt.plot([0,1],[0,1], linestyle="--")
+plt.scatter(cal_curve["p_mean"], cal_curve["y_mean"], s=np.maximum(10, cal_curve["n"]/cal_curve["n"].max()*60))
+plt.xlabel("Probabilité prédite")
+plt.ylabel("Fréquence observée")
+plt.title("Courbe de fiabilité (TEST)")
+plt.show()
+
+
+
+
+class PriceSensitiveConverter:
+    """
+    Wrapper d'inférence pour :
+      - prédire des probabilités calibrées
+      - garantir la mise à jour de log_price quand on change 'prime_commerciale'
+      - (aucun usage de prix par activité)
+    """
+    def __init__(self, calibrated_clf, num_cols, cat_cols):
+        self.model   = calibrated_clf
+        self.num_cols= list(num_cols)
+        self.cat_cols= list(cat_cols)
+        self.use_cols= self.num_cols + self.cat_cols
+
+    def _transform_df(self, df_like):
+        X = df_like.copy()
+        # (re)calcul log_price à partir de prime_commerciale (contrat)
+        X["log_price"] = np.log(X["prime_commerciale"].astype(float).clip(1e-9))
+        for c in self.cat_cols:
+            if X[c].dtype.name != "category":
+                X[c] = X[c].astype("category")
+        return X[self.use_cols]
+
+    def predict_proba_df(self, df_like):
+        X = self._transform_df(df_like)
+        return self.model.predict_proba(X)[:, 1]
+
+    def proba_at_price(self, row, pc_new):
+        tmp = row.to_frame().T.copy()
+        tmp.loc[:, "prime_commerciale"] = float(pc_new)
+        return float(self.predict_proba_df(tmp)[0])
+
+    def proba_vector_at_prices(self, df_like, pc_new_vector):
+        tmp = df_like.copy()
+        tmp.loc[:, "prime_commerciale"] = np.asarray(pc_new_vector, dtype=float)
+        return self.predict_proba_df(tmp)
+
+converter = PriceSensitiveConverter(
+    calibrated_clf=calibrated_clf,
+    num_cols=num_cols,
+    cat_cols=cat_cols
+)
+print("Wrapper prêt.")
+
+
+
+
+# On prend un exemple de contrat et on observe la proba vs. une grille de prix
+row = df_test.iloc[0]
+pc0 = float(row["prime_commerciale"])
+grid = pc0 * (1.0 + np.linspace(-0.10, 0.10, 21))  # -10% ... +10% autour du prix actuel
+probs = [converter.proba_at_price(row, p) for p in grid]
+
+# Affichage simple
+check = pd.DataFrame({"price": grid, "p": probs}).sort_values("price")
+display(check.head(10))
+display(check.tail(10))
+
+# Visualisation
+plt.figure()
+plt.plot(check["price"], check["p"])
+plt.xlabel("Prix (prime_commerciale)")
+plt.ylabel("Proba conversion calibrée")
+plt.title("Sensibilité au prix (doit décroître)")
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
