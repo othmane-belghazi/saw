@@ -1,0 +1,60 @@
+def optimize_approach2_failsafe(df, ebm_model,
+                                tau=None,
+                                step=0.005, s_max=0.08,
+                                alpha_total=0.97,
+                                delta_order=0.0,
+                                lam_vol=1e4):  # pénalité du slack volume
+    s_levels = np.round(np.arange(0.0, s_max + 1e-12, step), 6)
+    activities, N_ik, R_ik, C_ik, N0_by_act, N0_tot, ELR0_by_act = _precompute_grid_with_ebm(df, ebm_model, s_levels)
+    K = len(s_levels)
+    if tau is None:
+        tau = float(df['prime_pure'].sum() / df['prime_commerciale'].sum())
+
+    m = pulp.LpProblem("A2_FailSafe", pulp.LpMinimize)
+    x = {(a, k): pulp.LpVariable(f"x_{a}_{k}", lowBound=0, upBound=1, cat="Binary")
+         for a in activities for k in range(K)}
+    t  = pulp.LpVariable("t_abs_dev", lowBound=0)
+    v0 = pulp.LpVariable("slack_vol_global", lowBound=0)
+
+    # Objectif : t + lam_vol * v0
+    m += t + lam_vol * v0
+
+    for a in activities:
+        m += pulp.lpSum(x[(a, k)] for k in range(K)) == 1
+
+    R_tot = pulp.lpSum(x[(a, k)] * R_ik[(a, k)] for a in activities for k in range(K))
+    C_tot = pulp.lpSum(x[(a, k)] * C_ik[(a, k)] for a in activities for k in range(K))
+    N_tot = pulp.lpSum(x[(a, k)] * N_ik[(a, k)] for a in activities for k in range(K))
+
+    m += C_tot - tau * R_tot <= t
+    m += tau * R_tot - C_tot <= t
+    m += N_tot + v0 >= alpha_total * float(N0_tot)
+
+    ord_acts = sorted(activities, key=lambda a: float(ELR0_by_act[a]))
+    for u, v in zip(ord_acts, ord_acts[1:]):
+        m += pulp.lpSum(s_levels[k]*x[(u, k)] for k in range(K)) + delta_order \
+             <= pulp.lpSum(s_levels[k]*x[(v, k)] for k in range(K))
+
+    status = m.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] not in ("Optimal", "Feasible"):
+        raise RuntimeError(f"Fail-safe infaisable : {pulp.LpStatus[status]}")
+
+    rows = []
+    for a in activities:
+        k_star = max(range(K), key=lambda k: float(pulp.value(x[(a, k)]) or 0.0))
+        rows.append({"activite": a,
+                     "ELR0_pond": float(ELR0_by_act[a]),
+                     "s_opt": float(s_levels[k_star])})
+    res = pd.DataFrame(rows).sort_values(["s_opt","activite"]).reset_index(drop=True)
+
+    R_val = float(pulp.value(R_tot))
+    C_val = float(pulp.value(C_tot))
+    ELR_tot = (C_val / R_val) if R_val > 0 else 0.0
+    slack_vol = float(pulp.value(v0))
+    summary = {"tau_cible": float(tau),
+               "ELR_tot_opt": float(ELR_tot),
+               "abs_ecart": abs(float(C_val - tau * R_val)),
+               "N0_tot": float(N0_tot),
+               "N_tot_opt": float(pulp.value(N_tot)),
+               "slack_volume": slack_vol}
+    return res, summary
