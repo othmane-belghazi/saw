@@ -1,0 +1,75 @@
+# -----------------------------------------------
+# Approche 1 : Sans modèle de conversion (LP)
+# Objectif : rapprocher l'ELR global de tau + ordre des hausses
+# Option : geler les "bonnes" activités sous un seuil
+# -----------------------------------------------
+import numpy as np
+import pandas as pd
+import pulp
+
+def optimize_approach1(df,
+                       tau=None,
+                       s_max=0.08,
+                       delta_order=0.0,         # 0.0 = non strict ; ex 0.002 pour strict
+                       freeze_threshold=None,    # ex 0.60 => s_i = 0 si ELR0_i <= 0.60
+                       s_cap_good=None):         # ex 0.02 => s_i <= 2% si ELR0_i <= threshold
+    # Agrégats simples (sans conversion)
+    by_act = df.groupby('activite')
+    R0_by_act = by_act['prime_commerciale'].sum().astype(float)
+    C0_by_act = by_act['prime_pure'].sum().astype(float)
+    ELR0_by_act = (C0_by_act / R0_by_act.replace(0.0, np.nan)).fillna(0.0)
+    activities = sorted(R0_by_act.index.tolist())
+
+    Ctot0 = float(C0_by_act.sum())
+    if tau is None:
+        # cible par défaut : constante business
+        tau = float(df['prime_pure'].sum() / df['prime_commerciale'].sum())
+
+    # Modèle LP
+    m = pulp.LpProblem("A1_MinELRGap_NoConversion", pulp.LpMinimize)
+    s = {a: pulp.LpVariable(f"s_{a}", lowBound=0.0, upBound=s_max, cat="Continuous") for a in activities}
+    t = pulp.LpVariable("t_abs_dev", lowBound=0.0, cat="Continuous")
+
+    # Objectif
+    m += t
+
+    # |Ctot0 - tau * sum_i R0_i*(1+s_i)| <= t
+    Rtot_expr = pulp.lpSum(R0_by_act[a] * (1.0 + s[a]) for a in activities)
+    m += Ctot0 - tau * Rtot_expr <= t
+    m += tau * Rtot_expr - Ctot0 <= t
+
+    # Ordre s_u + delta <= s_v si ELR0_u <= ELR0_v
+    ord_acts = sorted(activities, key=lambda a: float(ELR0_by_act[a]))  # du meilleur au pire
+    for u, v in zip(ord_acts, ord_acts[1:]):
+        m += s[u] + delta_order <= s[v]
+
+    # Option : gel / cap pour les "bonnes" activités
+    if freeze_threshold is not None:
+        for a in activities:
+            if float(ELR0_by_act[a]) <= float(freeze_threshold):
+                if s_cap_good is None:
+                    m += s[a] == 0.0
+                else:
+                    m += s[a] <= float(s_cap_good)
+
+    # Solve
+    status = m.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] not in ("Optimal", "Feasible"):
+        raise RuntimeError(f"Approche 1 infaisable : {pulp.LpStatus[status]}")
+
+    # Résultats
+    rows = []
+    Rtot = 0.0
+    for a in activities:
+        s_a = float(pulp.value(s[a]))
+        rows.append({"activite": a,
+                     "ELR0": float(ELR0_by_act[a]),
+                     "s_opt": s_a})
+        Rtot += float(R0_by_act[a]) * (1.0 + s_a)
+    ELR_tot = Ctot0 / Rtot if Rtot > 0 else 0.0
+
+    res = pd.DataFrame(rows).sort_values(["s_opt","activite"]).reset_index(drop=True)
+    summary = {"tau_cible": float(tau),
+               "ELR_tot_opt": float(ELR_tot),
+               "abs_ecart": abs(float(Ctot0 - tau * Rtot))}
+    return res, summary
