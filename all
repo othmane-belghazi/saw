@@ -1,0 +1,269 @@
+# ==========================================
+# Optimisation des majorations par activité
+# Cible: rapprocher l'ELR global d'une valeur tau
+# Contraintes: volume par activité & global, ELR_i non dégradé, ordre des hausses
+# ==========================================
+
+# pip install pulp pandas numpy
+import numpy as np
+import pandas as pd
+import pulp
+
+# ---------- Utilitaires colonnes ----------
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {
+        'Numcontrat': 'numcontrat',
+        'code activité': 'code_activite',
+        'code activité ': 'code_activite',
+        'prime pure': 'prime_pure',
+        'prime commerciale': 'prime_commerciale',
+        'surface': 'surface',
+        'chiffre affaires': 'chiffre_affaires',
+        'type client': 'type_client',
+        'reduction': 'reduction',
+    }
+    df2 = df.copy()
+    cols_lower = {c.lower().strip(): c for c in df2.columns}
+    for k, v in list(mapping.items()):
+        lk = k.lower().strip()
+        if lk in cols_lower:
+            df2.rename(columns={cols_lower[lk]: v}, inplace=True)
+    expected = ['numcontrat','code_activite','prime_pure','prime_commerciale',
+                'surface','chiffre_affaires','type_client','reduction']
+    missing = [c for c in expected if c not in df2.columns]
+    if missing:
+        raise ValueError(f"Colonnes manquantes: {missing}")
+    return df2[expected].copy()
+
+# ---------- Fallback si EBM non branché ----------
+def example_proba_fn(row: pd.Series, pc_new: float) -> float:
+    """
+    A REMPLACER par TON EBM.
+    Cette fonction illustre une proba monotone décroissante en prix et sensible au CA, réduction, type.
+    """
+    z = (
+        -3.0
+        - 0.00008 * float(pc_new)
+        + 0.000004 * float(row['chiffre_affaires'])
+        + 0.12 * float(row['reduction'])
+        + (0.35 if str(row['type_client']).upper().startswith('PRO') else 0.0)
+    )
+    p = 1.0 / (1.0 + np.exp(-z))
+    return float(np.clip(p, 0.0, 1.0))
+
+# ---------- Baseline pondérée EBM ----------
+def baseline_by_activity(df: pd.DataFrame, proba_fn):
+    p0 = df.apply(lambda r: proba_fn(r, r['prime_commerciale']), axis=1)
+    df0 = df.assign(p0=p0)
+    by_act = df0.groupby('code_activite')
+    N0_i = by_act['p0'].sum().to_dict()
+    R0_i = (by_act.apply(lambda g: (g['p0'] * g['prime_commerciale']).sum())).to_dict()
+    C0_i = (by_act.apply(lambda g: (g['p0'] * g['prime_pure']).sum())).to_dict()
+    ELR0_i = {a: (C0_i[a]/R0_i[a] if R0_i[a] > 0 else 0.0) for a in N0_i.keys()}
+    N0_tot = float(df0['p0'].sum())
+    return N0_i, R0_i, C0_i, ELR0_i, N0_tot
+
+# ---------- ELR global "cible" par défaut ----------
+def elr_global_constant(df: pd.DataFrame) -> float:
+    # ELR constant business: somme(PP)/somme(PC) sur toute la base (sans pondération EBM)
+    PP = float(df['prime_pure'].sum())
+    PC = float(df['prime_commerciale'].sum())
+    return (PP/PC) if PC > 0 else 0.0
+
+# ---------- Pré-agrégats par activité et niveau de hausse ----------
+def preaggregate(df: pd.DataFrame, proba_fn, s_levels: np.ndarray):
+    """
+    Retourne:
+      agg[a][k] = {'s': s, 'N': N_i^k, 'R': R_i^k, 'C': C_i^k}
+    et un DataFrame 'details' utile pour diagnostic.
+    """
+    agg = {}
+    det_rows = []
+    for a, g in df.groupby('code_activite'):
+        g = g.copy()
+        out = []
+        for k, s in enumerate(s_levels):
+            pc_new = g['prime_commerciale'] * (1.0 + s)
+            p = g.apply(lambda r, price=pc_new.loc[r.name]: proba_fn(r, price), axis=1)
+            N = float(p.sum())
+            R = float((p * pc_new).sum())
+            C = float((p * g['prime_pure']).sum())
+            out.append({'s': float(s), 'N': N, 'R': R, 'C': C})
+            det_rows.append({'code_activite': a, 's': float(s), 'N': N, 'R': R, 'C': C,
+                             'ELR': (C/R if R > 0 else 0.0)})
+        agg[a] = out
+    details = pd.DataFrame(det_rows)
+    return agg, details
+
+# ---------- Solveur principal ----------
+def solve_majorations_to_target(
+    df_raw: pd.DataFrame,
+    proba_fn=example_proba_fn,
+    elr_cible: float = None,   # si None, on prendra somme(PP)/somme(PC)
+    step: float = 0.005,       # pas 0,5 pt
+    s_max: float = 0.08,       # borne 8%
+    alpha_activity: float = 0.95,  # volume min par activité
+    alpha_total: float = 0.97,     # volume min global
+    min_gap_order: float = 0.0,    # écart minimal entre hausses (ordre). 0 = non strict.
+    solver_verbose: bool = False
+):
+    """
+    Renvoie:
+      res_act (DataFrame): majoration optimale par activité + métriques,
+      resume (dict): résumé global,
+      details (DataFrame): N,R,C,ELR par activité et par niveau de s (diagnostic).
+    """
+    df = standardize_columns(df_raw)
+    activities = df['code_activite'].unique().tolist()
+    s_levels = np.round(np.arange(0.0, s_max + 1e-9, step), 6)
+    K = len(s_levels)
+
+    # Baseline pondérée EBM
+    N0_i, R0_i, C0_i, ELR0_i, N0_tot = baseline_by_activity(df, proba_fn)
+
+    # Cible ELR
+    tau = float(elr_global_constant(df)) if elr_cible is None else float(elr_cible)
+
+    # Pré-agrégats
+    agg, details = preaggregate(df, proba_fn, s_levels)
+
+    # --- Modèle MILP ---
+    m = pulp.LpProblem("Majoration_Activites_Cible_ELR", pulp.LpMinimize)
+
+    # Variables
+    x = {(a,k): pulp.LpVariable(f"x_{a}_{k}", lowBound=0, upBound=1, cat="Binary")
+         for a in activities for k in range(K)}
+    t = pulp.LpVariable("t_abs_dev", lowBound=0, cat="Continuous")
+
+    # Objectif: minimiser l'écart à la cible ELR globale
+    m += t
+
+    # Un seul niveau par activité
+    for a in activities:
+        m += pulp.lpSum(x[a,k] for k in range(K)) == 1
+
+    # Expressions R_tot et C_tot
+    R_tot_expr = pulp.lpSum(x[a,k] * agg[a][k]['R'] for a in activities for k in range(K))
+    C_tot_expr = pulp.lpSum(x[a,k] * agg[a][k]['C'] for a in activities for k in range(K))
+
+    # Proximité ELR cible: |C_tot - tau * R_tot| <= t
+    m += C_tot_expr - tau * R_tot_expr <= t
+    m += tau * R_tot_expr - C_tot_expr <= t
+
+    # Volume global
+    N_tot_expr = pulp.lpSum(x[a,k] * agg[a][k]['N'] for a in activities for k in range(K))
+    m += N_tot_expr >= alpha_total * N0_tot
+
+    # Volume par activité & amélioration ELR_i
+    for a in activities:
+        # Volume min par activité
+        m += pulp.lpSum(x[a,k] * agg[a][k]['N'] for k in range(K)) >= alpha_activity * N0_i[a]
+        # ELR_i(s) <= ELR_i^0  -->  C_i(s) <= ELR_i^0 * R_i(s)
+        m += pulp.lpSum(x[a,k] * agg[a][k]['C'] for k in range(K)) \
+             <= ELR0_i[a] * pulp.lpSum(x[a,k] * agg[a][k]['R'] for k in range(K))
+
+    # Ordre des hausses: trier par ELR0 croissant, imposer s_u <= s_v
+    ord_act = sorted(activities, key=lambda a: ELR0_i[a])  # meilleur -> pire
+    for u, v in zip(ord_act, ord_act[1:]):
+        m += pulp.lpSum(s_levels[k] * x[u,k] for k in range(K)) \
+             + min_gap_order <= pulp.lpSum(s_levels[k] * x[v,k] for k in range(K))
+
+    # Résolution
+    status = m.solve(pulp.PULP_CBC_CMD(msg=solver_verbose))
+    if pulp.LpStatus[status] not in ('Optimal', 'Feasible'):
+        raise RuntimeError(f"Pas de solution: {pulp.LpStatus[status]} "
+                           f"(assouplis alpha_activity/alpha_total ou min_gap_order).")
+
+    # Extraction résultats
+    rows = []
+    for a in activities:
+        # choix k*
+        k_star = max(range(K), key=lambda k: pulp.value(x[a,k]))
+        s_star = float(s_levels[k_star])
+        N_star = float(agg[a][k_star]['N'])
+        R_star = float(agg[a][k_star]['R'])
+        C_star = float(agg[a][k_star]['C'])
+        ELR_star = (C_star / R_star) if R_star > 0 else 0.0
+        rows.append({
+            'code_activite': a,
+            's_opt': s_star,
+            'N_opt': N_star,
+            'R_opt': R_star,
+            'C_opt': C_star,
+            'ELR_opt': ELR_star,
+            'ELR0_act': float(ELR0_i[a]),
+            'N0_act': float(N0_i[a])
+        })
+    res_act = pd.DataFrame(rows).sort_values('s_opt').reset_index(drop=True)
+
+    # Résumé global
+    R_tot_opt = float(pulp.value(R_tot_expr))
+    C_tot_opt = float(pulp.value(C_tot_expr))
+    N_tot_opt = float(pulp.value(N_tot_expr))
+    ELR_tot_opt = (C_tot_opt / R_tot_opt) if R_tot_opt > 0 else 0.0
+    t_val = float(pulp.value(t))
+
+    resume = dict(
+        tau_cible=tau,
+        t_deviation=t_val,
+        N0_tot=float(N0_tot),
+        N_tot_opt=N_tot_opt,
+        R_tot_opt=R_tot_opt,
+        C_tot_opt=C_tot_opt,
+        ELR_tot_opt=ELR_tot_opt,
+        alpha_activity=alpha_activity,
+        alpha_total=alpha_total,
+        min_gap_order=min_gap_order,
+        pas_grille=step,
+        nb_niveaux=len(s_levels),
+        nb_activites=len(activities),
+        statut=pulp.LpStatus[status]
+    )
+
+    return res_act, resume, details
+
+# ---------- Exemple d'utilisation ----------
+if __name__ == "__main__":
+    # Exemple jouet (remplace par ton CSV réel)
+    data = {
+        'Numcontrat': [1,2,3,4,5,6,7,8],
+        'code activité': ['A','A','A','B','B','C','C','C'],
+        'prime pure': [80,120,100,50,60,200,180,170],
+        'prime commerciale': [100,160,130,70,90,250,220,210],
+        'surface': [50,80,60,40,60,120,100,110],
+        'chiffre affaires': [100000,150000,120000,90000,110000,300000,280000,290000],
+        'type client': ['PRO','PART','PRO','PRO','PART','PRO','PART','PART'],
+        'reduction': [0.10,0.05,0.00,0.08,0.00,0.12,0.03,0.02],
+    }
+    df = pd.DataFrame(data)
+
+    # Branche TON EBM ici: remplace example_proba_fn par ta fonction
+    # def proba_fn(row, pc_new):
+    #     X = {
+    #       "prime_commerciale": float(pc_new),
+    #       "surface": float(row["surface"]),
+    #       "chiffre_affaires": float(row["chiffre_affaires"]),
+    #       "type_client": row["type_client"],  # selon encodage EBM
+    #       "reduction": float(row["reduction"]),
+    #     }
+    #     p = ebm.predict_proba(pd.DataFrame([X]))[0,1]
+    #     return float(np.clip(p, 0.0, 1.0))
+
+    res_act, resume, details = solve_majorations_to_target(
+        df,
+        proba_fn=example_proba_fn,  # <-- remplace par TON EBM
+        elr_cible=None,            # None => cible = somme(PP)/somme(PC) (constante business)
+        step=0.005,                # 0,5 pt
+        s_max=0.08,                # 8%
+        alpha_activity=0.95,       # volume min par activité = 95% du baseline
+        alpha_total=0.97,          # volume min global = 97% du baseline
+        min_gap_order=0.0,         # 0 si ordre non strict; ex. 0.002 (=0,2 pt) pour stricte
+        solver_verbose=False
+    )
+
+    print("\n=== Majoration optimale par activité ===")
+    print(res_act.to_string(index=False))
+
+    print("\n=== Résumé global ===")
+    for k, v in resume.items():
+        print(f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}")
