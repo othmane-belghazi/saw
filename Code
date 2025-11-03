@@ -1,168 +1,217 @@
-# %% [markdown]
-# 🟢 1. Imports et paramètres globaux
+# ============================================================
+# Optimisation des majorations par activité (formulation MILP)
+# df : DataFrame existant avec colonnes:
+#   ['numcnt','activite','prime_pure','prime_commerciale','surafce','CA','type_client','reduction']
+# ebm_model : modèle EBM existant, prêt (pipeline)
+# ============================================================
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution
-from functools import partial
+import pulp
 
-# paramètres à ajuster
-lambda_elr = 1.0
-lambda_vol = 1.0
-x_min, x_max = 0.0, 0.08
-max_iter = 60
-random_state = 42
+# -----------------------------
+# Paramètres du problème
+# -----------------------------
+# Grille de majorations (0% à 8% par pas de 0,5 pt)
+step = 0.005         # 0.5 point = 0,5%
+s_max = 0.08         # 8%
+s_levels = np.round(np.arange(0.0, s_max + 1e-12, step), 6)
+K = len(s_levels)
 
-# si le modèle EBM est déjà chargé :
-# import pickle
-# with open('ebm_model.pkl','rb') as f:
-#     ebm_model = pickle.load(f)
+# Contraintes de volume (par activité et global)
+alpha_activity = 0.95   # >= 95% du volume attendu baseline par activité
+alpha_total    = 0.97   # >= 97% du volume attendu baseline global
 
+# Ordre des hausses : plus ELR0 élevé => majoration au moins aussi élevée
+delta_s_order = 0.0     # mettre p.ex. 0.002 (0,2 pt) pour un ordre strict croissant
 
-# %% [markdown]
-# 🟢 2. Vérification de la donnée de base `df`
+# Cible d'ELR global : par défaut "constante business" = somme(PP)/somme(PC) du portefeuille
+tau = float(df['prime_pure'].sum() / df['prime_commerciale'].sum())
 
-cols_requis = ['numcontrat','activity_code','PC','PP','surface','type_client','local','chiffre_affaires']
-if 'df' not in globals():
-    raise RuntimeError("⚠️ La DataFrame 'df' doit être déjà chargée en mémoire.")
-if any(c not in df.columns for c in cols_requis):
-    raise RuntimeError(f"Colonnes manquantes : {set(cols_requis) - set(df.columns)}")
+# -----------------------------
+# 1) Baseline pondérée EBM (s=0)
+# -----------------------------
+# Prépare l'input pour l'EBM au tarif actuel
+X0 = pd.DataFrame({
+    'prime_commerciale': df['prime_commerciale'].astype(float),
+    'surafce': df['surafce'],              # garder tel quel: cohérent avec l'entraînement de ton EBM
+    'CA': df['CA'],
+    'type_client': df['type_client'],
+    'reduction': df['reduction'].astype(float)
+})
 
-# liste des activités
-activites = sorted(df['activity_code'].unique().tolist())
-n = len(activites)
+proba0_raw = ebm_model.predict_proba(X0)
+proba0 = np.asarray(proba0_raw)
+# Gestion souple des sorties (2 colonnes proba classe 0/1 ou 1 colonne proba positive)
+if proba0.ndim == 2 and proba0.shape[1] >= 2:
+    p0 = proba0[:, 1]
+else:
+    p0 = proba0.reshape(-1)
+p0 = np.clip(p0, 0.0, 1.0)
 
-# regroupement par activité
-df_act = {act: df[df['activity_code'] == act].reset_index(drop=True) for act in activites}
+df0 = df.copy()
+df0['p0'] = p0
+# Agrégats baseline par activité
+N0_by_act = df0.groupby('activite')['p0'].sum()
+R0_by_act = (df0['p0'] * df0['prime_commerciale']).groupby(df0['activite']).sum()
+C0_by_act = (df0['p0'] * df0['prime_pure']).groupby(df0['activite']).sum()
+ELR0_by_act = (C0_by_act / R0_by_act.replace(0.0, np.nan)).fillna(0.0)
+N0_tot = float(df0['p0'].sum())
 
-##############################
+activities = sorted(df['activite'].unique().tolist())
 
+# -----------------------------
+# 2) Pré-agrégats EBM sur la grille s_levels
+# -----------------------------
+# Pour chaque niveau de hausse s, on recalcule les probabilités de conversion
+# puis on agrège par activité : N_i^k, R_i^k, C_i^k.
+N_ik, R_ik, C_ik = {}, {}, {}
 
-# %% [markdown]
-# 🟢 3. Calcul des valeurs initiales : ELR global et volumes initiaux
+for k, s in enumerate(s_levels):
+    PC_new = df['prime_commerciale'].astype(float) * (1.0 + s)
+    Xk = pd.DataFrame({
+        'prime_commerciale': PC_new,
+        'surafce': df['surafce'],
+        'CA': df['CA'],
+        'type_client': df['type_client'],
+        'reduction': df['reduction'].astype(float)
+    })
+    proba_raw = ebm_model.predict_proba(Xk)
+    proba = np.asarray(proba_raw)
+    if proba.ndim == 2 and proba.shape[1] >= 2:
+        p = proba[:, 1]
+    else:
+        p = proba.reshape(-1)
+    p = np.clip(p, 0.0, 1.0)
 
-gwp_tot = 0
-pp_tot = 0
-elr_par_act = {}
-n_init = {}
+    tmp = pd.DataFrame({
+        'activite': df['activite'],
+        'p': p,
+        'PC_new': PC_new,
+        'PP': df['prime_pure'].astype(float)
+    })
+    N_k = tmp.groupby('activite')['p'].sum()
+    R_k = (tmp['p'] * tmp['PC_new']).groupby(tmp['activite']).sum()
+    C_k = (tmp['p'] * tmp['PP']).groupby(tmp['activite']).sum()
 
-for act in activites:
-    data = df_act[act].copy()
-    f0 = ebm_model.predict_proba(data)[:,1]
-    f0 = np.clip(f0,0,1)
-    pc = data['PC'].values
-    pp = data['PP'].values
-    
-    gwp_i = np.sum(pc * f0)
-    pp_i = np.sum(pp * f0)
-    n_i = np.sum(f0)
-    
-    gwp_tot += gwp_i
-    pp_tot += pp_i
-    elr_par_act[act] = pp_i / gwp_i if gwp_i>0 else np.inf
-    n_init[act] = n_i
+    for a in activities:
+        N_ik[(a, k)] = float(N_k.get(a, 0.0))
+        R_ik[(a, k)] = float(R_k.get(a, 0.0))
+        C_ik[(a, k)] = float(C_k.get(a, 0.0))
 
-elr_global = pp_tot / gwp_tot
-print(f"ELR produit global initial : {elr_global:.4f}")
+# -----------------------------
+# 3) Construction du modèle MILP (PuLP)
+# -----------------------------
+m = pulp.LpProblem("Majoration_Activites_Cible_ELR", pulp.LpMinimize)
 
+# Variables binaires x_{i,k} : choix du niveau s^k pour l'activité i
+x = {(a, k): pulp.LpVariable(f"x_{a}_{k}", lowBound=0, upBound=1, cat="Binary")
+     for a in activities for k in range(K)}
 
+# Variable t >= 0 : écart absolu à la cible ELR (|C_tot - tau*R_tot|)
+t = pulp.LpVariable("t_abs_dev", lowBound=0, cat="Continuous")
 
-# %% [markdown]
-# 🟢 4. Fonction objectif S(X) sans utiliser def (écrite inline dans la boucle d'optimisation)
+# Objectif : minimiser t
+m += t
 
-# on crée une fonction lambda pour differential_evolution
-# cette fonction calcule -S(X) (car l'algo minimise)
+# Un seul niveau par activité
+for a in activities:
+    m += pulp.lpSum(x[(a, k)] for k in range(K)) == 1, f"one_level_{a}"
 
-def objectif(x_vect):
-    total_gwp = 0
-    pen_elr = 0
-    pen_vol = 0
-    
-    for idx, act in enumerate(activites):
-        x_i = float(x_vect[idx])
-        data = df_act[act].copy()
-        
-        # appliquer majoration sur la prime
-        data['PC_mod'] = data['PC'] * (1 + x_i)
-        f = ebm_model.predict_proba(data)[:,1]
-        f = np.clip(f,0,1)
-        
-        pc = data['PC_mod'].values
-        pp = data['PP'].values
-        
-        gwp_i = np.sum(pc * f)
-        pp_i = np.sum(pp * f)
-        n_i = np.sum(f)
-        
-        elr_i = pp_i / gwp_i if gwp_i>0 else np.inf
-        
-        total_gwp += gwp_i
-        
-        # pénalisation ELR
-        depassement = max(0, elr_i - elr_global)
-        pen_elr += depassement * gwp_i
-        
-        # pénalisation volume
-        seuil = 0.95 * n_init[act]
-        pen_vol += max(0, seuil - n_i)
-    
-    s = total_gwp - lambda_elr*pen_elr - lambda_vol*pen_vol
-    return -s  # on minimise -S
+# Expressions globales : N_tot, R_tot, C_tot
+R_tot_expr = pulp.lpSum(x[(a, k)] * R_ik[(a, k)] for a in activities for k in range(K))
+C_tot_expr = pulp.lpSum(x[(a, k)] * C_ik[(a, k)] for a in activities for k in range(K))
+N_tot_expr = pulp.lpSum(x[(a, k)] * N_ik[(a, k)] for a in activities for k in range(K))
 
+# Proximité de la cible ELR : |C_tot - tau * R_tot| <= t
+m += C_tot_expr - tau * R_tot_expr <= t, "ELR_target_pos"
+m += tau * R_tot_expr - C_tot_expr <= t, "ELR_target_neg"
 
+# Volume global minimal
+m += N_tot_expr >= alpha_total * N0_tot, "volume_global"
 
+# Volume minimal par activité + amélioration ELR_i
+for a in activities:
+    # Volume par activité
+    m += pulp.lpSum(x[(a, k)] * N_ik[(a, k)] for k in range(K)) >= alpha_activity * float(N0_by_act.get(a, 0.0)), f"vol_act_{a}"
+    # ELR_i(s) <= ELR_i^0  ->  C_i(s) <= ELR_i^0 * R_i(s)
+    ELR0_a = float(ELR0_by_act.get(a, 0.0))
+    m += pulp.lpSum(x[(a, k)] * C_ik[(a, k)] for k in range(K)) \
+         <= ELR0_a * pulp.lpSum(x[(a, k)] * R_ik[(a, k)] for k in range(K)), f"elr_improve_{a}"
 
+# Ordre des hausses (cohérence) : trier activités par ELR0 croissant
+ord_acts = sorted(activities, key=lambda a: float(ELR0_by_act.get(a, 0.0)))  # meilleur -> pire
+for u, v in zip(ord_acts, ord_acts[1:]):  # s_u + delta <= s_v
+    m += pulp.lpSum(s_levels[k] * x[(u, k)] for k in range(K)) + delta_s_order \
+         <= pulp.lpSum(s_levels[k] * x[(v, k)] for k in range(K)), f"order_{u}_to_{v}"
 
-# %% [markdown]
-# 🟢 5. Lancement de l'optimisation
+# -----------------------------
+# 4) Résolution
+# -----------------------------
+status = m.solve(pulp.PULP_CBC_CMD(msg=False))
+status_str = pulp.LpStatus[status]
+if status_str not in ("Optimal", "Feasible"):
+    raise RuntimeError(f"Pas de solution réalisable ({status_str}). "
+                       f"Assouplir alpha_activity/alpha_total ou delta_s_order ou ajuster tau.")
 
-bornes = [(x_min, x_max) for _ in range(n)]
+# -----------------------------
+# 5) Extraction des résultats
+# -----------------------------
+rows = []
+for a in activities:
+    # niveau choisi = argmax_k x_{a,k}
+    k_star = max(range(K), key=lambda k: float(pulp.value(x[(a, k)]) or 0.0))
+    s_star = float(s_levels[k_star])
+    N_star = float(N_ik[(a, k_star)])
+    R_star = float(R_ik[(a, k_star)])
+    C_star = float(C_ik[(a, k_star)])
+    ELR_star = (C_star / R_star) if R_star > 0 else 0.0
 
-resultat = differential_evolution(
-    objectif,
-    bounds=bornes,
-    maxiter=max_iter,
-    seed=random_state,
-    polish=True
-)
-
-x_opt = resultat.x
-print("✅ Optimisation terminée.")
-print(f"Score objectif : {-resultat.fun:.2f}")
-print("Majorations optimales par activité :")
-for act, x in zip(activites, x_opt):
-    print(f"  {act} → {x*100:.2f}%")
-
-
-
-
-# %% [markdown]
-# 🟢 6. Calcul des indicateurs finaux par activité après optimisation
-
-res = []
-for idx, act in enumerate(activites):
-    x_i = float(x_opt[idx])
-    data = df_act[act].copy()
-    data['PC_mod'] = data['PC'] * (1 + x_i)
-    f = ebm_model.predict_proba(data)[:,1]
-    f = np.clip(f,0,1)
-    
-    gwp_i = np.sum(data['PC_mod'] * f)
-    pp_i = np.sum(data['PP'] * f)
-    n_i = np.sum(f)
-    elr_i = pp_i / gwp_i if gwp_i>0 else np.inf
-    
-    res.append({
-        'activity_code': act,
-        'x_i': x_i,
-        'gwp_i': gwp_i,
-        'pp_i': pp_i,
-        'n_i': n_i,
-        'elr_i': elr_i
+    rows.append({
+        "activite": a,
+        "s_opt": s_star,
+        "N_opt": N_star,
+        "R_opt": R_star,
+        "C_opt": C_star,
+        "ELR_opt": ELR_star,
+        "ELR0_act": float(ELR0_by_act.get(a, 0.0)),
+        "N0_act": float(N0_by_act.get(a, 0.0))
     })
 
-df_res = pd.DataFrame(res).sort_values('activity_code').reset_index(drop=True)
-display(df_res)
-print(f"GWP total optimisé : {df_res['gwp_i'].sum():.2f}")
+res_act = pd.DataFrame(rows).sort_values(["s_opt","activite"]).reset_index(drop=True)
 
+R_tot_opt = float(pulp.value(R_tot_expr))
+C_tot_opt = float(pulp.value(C_tot_expr))
+N_tot_opt = float(pulp.value(N_tot_expr))
+ELR_tot_opt = (C_tot_opt / R_tot_opt) if R_tot_opt > 0 else 0.0
+t_val = float(pulp.value(t))
 
+resume = {
+    "statut": status_str,
+    "tau_cible": tau,
+    "t_deviation": t_val,
+    "N0_tot": float(N0_tot),
+    "N_tot_opt": N_tot_opt,
+    "R_tot_opt": R_tot_opt,
+    "C_tot_opt": C_tot_opt,
+    "ELR_tot_opt": ELR_tot_opt,
+    "alpha_activity": alpha_activity,
+    "alpha_total": alpha_total,
+    "delta_s_order": delta_s_order,
+    "pas_grille": step,
+    "nb_niveaux": K,
+    "nb_activites": len(activities)
+}
+
+# -----------------------------
+# 6) Affichage des résultats
+# -----------------------------
+print("=== Majoration optimale par activité ===")
+print(res_act.to_string(index=False))
+
+print("\n=== Résumé global ===")
+for k, v in resume.items():
+    if isinstance(v, float):
+        print(f"{k}: {v:.6f}")
+    else:
+        print(f"{k}: {v}")
