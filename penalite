@@ -1,0 +1,251 @@
+# ============================================================
+# Optimisation lexicographique robuste (avec slacks pénalisés)
+# ------------------------------------------------------------
+# Etape 1R (robuste) : Min t + pénalités de slacks  => toujours faisable
+# Etape 2  (éco)     : Max profit sous écart ELR <= t* + eps
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import pulp
+
+# ---------- Paramètres ----------
+step = 0.005
+s_max = 0.08
+s_levels = np.round(np.arange(0.0, s_max + 1e-12, step), 6)
+K = len(s_levels)
+
+alpha_activity = 0.95
+alpha_total    = 0.97
+delta_s_order  = 0.0     # mettre 0.002 pour un ordre strict si souhaité
+eps_deviation  = 0.0     # marge autour de t* en étape 2
+hedge          = 0.0     # prudence sur proba (0 recommandé si calibration OK)
+
+# Pondérations des slacks (à ajuster si besoin)
+LAM_ELR   = 1e6   # pénalité slack ELR local
+LAM_VTOT  = 1e4   # pénalité slack volume global
+LAM_VACT  = 1e3   # pénalité slack volume activité
+LAM_ORDRE = 1e2   # pénalité slack ordre
+
+# Cible d'ELR globale (constante business par défaut)
+tau = float(df['prime_pure'].sum() / df['prime_commerciale'].sum())
+
+activities = sorted(df['activite'].unique().tolist())
+
+# ---------- Baseline EBM ----------
+X0 = pd.DataFrame({
+    'prime_commerciale': df['prime_commerciale'].astype(float),
+    'surafce': df['surafce'],
+    'CA': df['CA'],
+    'type_client': df['type_client'],
+    'reduction': df['reduction'].astype(float),
+})
+proba0_raw = ebm_model.predict_proba(X0)
+proba0 = np.asarray(proba0_raw)
+if proba0.ndim == 2 and proba0.shape[1] >= 2:
+    p0 = proba0[:, 1]
+else:
+    p0 = proba0.reshape(-1)
+p0 = np.clip(p0 - hedge, 0.0, 1.0)
+
+df0 = df.copy()
+df0['p0'] = p0
+N0_by_act = df0.groupby('activite')['p0'].sum()
+R0_by_act = (df0['p0'] * df0['prime_commerciale']).groupby(df0['activite']).sum()
+C0_by_act = (df0['p0'] * df0['prime_pure']).groupby(df0['activite']).sum()
+ELR0_by_act = (C0_by_act / R0_by_act.replace(0.0, np.nan)).fillna(0.0)
+N0_tot = float(df0['p0'].sum())
+
+# ---------- Pré-agrégats sur la grille ----------
+N_ik, R_ik, C_ik = {}, {}, {}
+for k, s in enumerate(s_levels):
+    PC_new = df['prime_commerciale'].astype(float) * (1.0 + s)
+    Xk = pd.DataFrame({
+        'prime_commerciale': PC_new,
+        'surafce': df['surafce'],
+        'CA': df['CA'],
+        'type_client': df['type_client'],
+        'reduction': df['reduction'].astype(float),
+    })
+    proba_raw = ebm_model.predict_proba(Xk)
+    proba = np.asarray(proba_raw)
+    if proba.ndim == 2 and proba.shape[1] >= 2:
+        p = proba[:, 1]
+    else:
+        p = proba.reshape(-1)
+    p = np.clip(p - hedge, 0.0, 1.0)
+
+    tmp = pd.DataFrame({
+        'activite': df['activite'],
+        'p': p,
+        'PC_new': PC_new,
+        'PP': df['prime_pure'].astype(float),
+    })
+    N_k = tmp.groupby('activite')['p'].sum()
+    R_k = (tmp['p'] * tmp['PC_new']).groupby(tmp['activite']).sum()
+    C_k = (tmp['p'] * tmp['PP']).groupby(tmp['activite']).sum()
+
+    for a in activities:
+        N_ik[(a, k)] = float(N_k.get(a, 0.0))
+        R_ik[(a, k)] = float(R_k.get(a, 0.0))
+        C_ik[(a, k)] = float(C_k.get(a, 0.0))
+
+# ============================================================
+# ÉTAPE 1R : Min t + pénalités slacks  (toujours faisable)
+# ============================================================
+m1 = pulp.LpProblem("Step1R_MinGap_with_Slacks", pulp.LpMinimize)
+
+# Variables binaires
+x1 = {(a, k): pulp.LpVariable(f"x1_{a}_{k}", lowBound=0, upBound=1, cat="Binary")
+      for a in activities for k in range(K)}
+
+# t = écart à la cible ELR globale
+t = pulp.LpVariable("t_abs_dev", lowBound=0)
+
+# Slacks
+v0 = pulp.LpVariable("slack_vol_global", lowBound=0)  # volume global
+v  = {a: pulp.LpVariable(f"slack_vol_{a}", lowBound=0) for a in activities}  # volume activité
+w  = {a: pulp.LpVariable(f"slack_elr_{a}", lowBound=0) for a in activities}  # ELR local
+# Slacks d'ordre (entre paires adjacentes dans l'ordre ELR0)
+ord_acts = sorted(activities, key=lambda a: float(ELR0_by_act.get(a, 0.0)))
+o = {}
+for u, vpair in zip(ord_acts, ord_acts[1:]):
+    o[(u, vpair)] = pulp.LpVariable(f"slack_ord_{u}_{vpair}", lowBound=0)
+
+# Objectif : t + pénalités slacks
+m1 += (
+    t
+    + LAM_VTOT * v0
+    + LAM_VACT * pulp.lpSum(v[a] for a in activities)
+    + LAM_ELR  * pulp.lpSum(w[a] for a in activities)
+    + LAM_ORDRE* pulp.lpSum(o[pair] for pair in o)
+)
+
+# Un niveau par activité
+for a in activities:
+    m1 += pulp.lpSum(x1[(a, k)] for k in range(K)) == 1
+
+# Expressions globales
+R_tot_1 = pulp.lpSum(x1[(a, k)] * R_ik[(a, k)] for a in activities for k in range(K))
+C_tot_1 = pulp.lpSum(x1[(a, k)] * C_ik[(a, k)] for a in activities for k in range(K))
+N_tot_1 = pulp.lpSum(x1[(a, k)] * N_ik[(a, k)] for a in activities for k in range(K))
+
+# Ecart ELR cible
+m1 += C_tot_1 - tau * R_tot_1 <= t
+m1 += tau * R_tot_1 - C_tot_1 <= t
+
+# Volume global (avec slack)
+m1 += N_tot_1 + v0 >= alpha_total * N0_tot
+
+# Volume activité (avec slacks) + ELR_i (avec slacks)
+for a in activities:
+    m1 += pulp.lpSum(x1[(a, k)] * N_ik[(a, k)] for k in range(K)) + v[a] \
+         >= alpha_activity * float(N0_by_act.get(a, 0.0))
+    ELR0_a = float(ELR0_by_act.get(a, 0.0))
+    m1 += pulp.lpSum(x1[(a, k)] * C_ik[(a, k)] for k in range(K)) \
+         <= ELR0_a * pulp.lpSum(x1[(a, k)] * R_ik[(a, k)] for k in range(K)) + w[a]
+
+# Ordre (avec slack)
+for u, vpair in zip(ord_acts, ord_acts[1:]):
+    m1 += pulp.lpSum(s_levels[k]*x1[(u, k)] for k in range(K)) + delta_s_order - o[(u, vpair)] \
+         <= pulp.lpSum(s_levels[k]*x1[(vpair, k)] for k in range(K))
+
+# Solve
+status1 = m1.solve(pulp.PULP_CBC_CMD(msg=False))
+if pulp.LpStatus[status1] not in ("Optimal", "Feasible"):
+    raise RuntimeError(f"Etape 1R non résolue: {pulp.LpStatus[status1]}")
+
+t_star = float(pulp.value(t))
+
+# ============================================================
+# ÉTAPE 2 : Max profit sous |C - tau R| <= t* + eps  (sans slacks)
+# ============================================================
+m2 = pulp.LpProblem("Step2_MaxProfit", pulp.LpMaximize)
+x2 = {(a, k): pulp.LpVariable(f"x2_{a}_{k}", lowBound=0, upBound=1, cat="Binary")
+      for a in activities for k in range(K)}
+
+# Objectif : Max profit
+m2 += pulp.lpSum(x2[(a, k)] * (R_ik[(a, k)] - C_ik[(a, k)]) for a in activities for k in range(K))
+
+# Un niveau par activité
+for a in activities:
+    m2 += pulp.lpSum(x2[(a, k)] for k in range(K)) == 1
+
+# Expressions globales
+R_tot_2 = pulp.lpSum(x2[(a, k)] * R_ik[(a, k)] for a in activities for k in range(K))
+C_tot_2 = pulp.lpSum(x2[(a, k)] * C_ik[(a, k)] for a in activities for k in range(K))
+N_tot_2 = pulp.lpSum(x2[(a, k)] * N_ik[(a, k)] for a in activities for k in range(K))
+
+# Ecart à la cible borné par t* + eps
+m2 += C_tot_2 - tau * R_tot_2 <= t_star + eps_deviation
+m2 += tau * R_tot_2 - C_tot_2 <= t_star + eps_deviation
+
+# Volumes et ELR_i sans slack (on peut en remettre si nécessaire)
+m2 += N_tot_2 >= alpha_total * N0_tot
+for a in activities:
+    m2 += pulp.lpSum(x2[(a, k)] * N_ik[(a, k)] for k in range(K)) >= alpha_activity * float(N0_by_act.get(a, 0.0))
+    ELR0_a = float(ELR0_by_act.get(a, 0.0))
+    m2 += pulp.lpSum(x2[(a, k)] * C_ik[(a, k)] for k in range(K)) \
+         <= ELR0_a * pulp.lpSum(x2[(a, k)] * R_ik[(a, k)] for k in range(K))
+
+# Ordre
+for u, vpair in zip(ord_acts, ord_acts[1:]):
+    m2 += pulp.lpSum(s_levels[k]*x2[(u, k)] for k in range(K)) + delta_s_order \
+         <= pulp.lpSum(s_levels[k]*x2[(vpair, k)] for k in range(K))
+
+status2 = m2.solve(pulp.PULP_CBC_CMD(msg=False))
+if pulp.LpStatus[status2] not in ("Optimal", "Feasible"):
+    # Si vraiment encore infaisable, remettre des slacks et pénalités ici aussi.
+    raise RuntimeError(f"Etape 2 infaisable: {pulp.LpStatus[status2]} \
+(conseil: augmenter eps_deviation ou remettre des slacks avec pénalités).")
+
+# ---------- Résultats finaux ----------
+rows = []
+for a in activities:
+    k_star = max(range(K), key=lambda k: float(pulp.value(x2[(a, k)]) or 0.0))
+    s_star = float(s_levels[k_star])
+    N_star = float(N_ik[(a, k_star)])
+    R_star = float(R_ik[(a, k_star)])
+    C_star = float(C_ik[(a, k_star)])
+    ELR_star = (C_star / R_star) if R_star > 0 else 0.0
+    rows.append({
+        "activite": a,
+        "s_opt": s_star,
+        "N_opt": N_star,
+        "R_opt": R_star,
+        "C_opt": C_star,
+        "ELR_opt": ELR_star,
+        "ELR0_act": float(ELR0_by_act.get(a, 0.0)),
+        "N0_act": float(N0_by_act.get(a, 0.0)),
+    })
+
+res_act = pd.DataFrame(rows).sort_values(["s_opt","activite"]).reset_index(drop=True)
+
+R_tot_opt = float(pulp.value(R_tot_2))
+C_tot_opt = float(pulp.value(C_tot_2))
+N_tot_opt = float(pulp.value(N_tot_2))
+ELR_tot_opt = (C_tot_opt / R_tot_opt) if R_tot_opt > 0 else 0.0
+
+print("=== Majoration optimale par activité (Etape 2) ===")
+display(res_act)
+
+print("\n=== Résumé global ===")
+print(f"Statut Etape 1R : {pulp.LpStatus[status1]} | t* = {t_star:.6f}")
+print(f"Statut Etape 2  : {pulp.LpStatus[status2]}")
+print(f"tau cible          : {tau:.6f}")
+print(f"ELR_tot (opt)      : {ELR_tot_opt:.6f}")
+print(f"|C_tot - tau R_tot|: {abs(C_tot_opt - tau*R_tot_opt):.6f}")
+print(f"N0_tot -> N_tot    : {N0_tot:.2f} -> {N_tot_opt:.2f}")
+print(f"R_tot (opt)        : {R_tot_opt:.2f}")
+print(f"C_tot (opt)        : {C_tot_opt:.2f}")
+
+# (Option) Afficher les slacks de l'étape 1R pour diagnostic
+print("\n=== Slacks Etape 1R (si > 0, contrainte difficile) ===")
+slacks_report = []
+slacks_report.append(("vol_global", float(pulp.value(v0))))
+for a in activities:
+    slacks_report.append((f"vol_{a}", float(pulp.value(v[a]))))
+    slacks_report.append((f"elr_{a}", float(pulp.value(w[a]))))
+for (u, vpair), var in o.items():
+    slacks_report.append((f"ordre_{u}->{vpair}", float(pulp.value(var))))
+display(pd.DataFrame(slacks_report, columns=["contrainte","slack"]))
