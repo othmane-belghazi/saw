@@ -1,80 +1,100 @@
-# ============================================================
-# Optimisation des majorations par activité (formulation MILP)
-# df : DataFrame existant avec colonnes:
-#   ['numcnt','activite','prime_pure','prime_commerciale','surafce','CA','type_client','reduction']
-# ebm_model : modèle EBM existant, prêt (pipeline)
-# ============================================================
-
+# === Imports et paramètres ===
 import numpy as np
 import pandas as pd
 import pulp
 
-# -----------------------------
-# Paramètres du problème
-# -----------------------------
-# Grille de majorations (0% à 8% par pas de 0,5 pt)
-step = 0.005         # 0.5 point = 0,5%
-s_max = 0.08         # 8%
+# Grille de majorations autorisées (0% à 8% par pas de 0,5 point)
+step = 0.005          # 0.5 point = 0,5%
+s_max = 0.08          # 8%
 s_levels = np.round(np.arange(0.0, s_max + 1e-12, step), 6)
 K = len(s_levels)
 
-# Contraintes de volume (par activité et global)
-alpha_activity = 0.95   # >= 95% du volume attendu baseline par activité
-alpha_total    = 0.97   # >= 97% du volume attendu baseline global
+# Contraintes de volume
+alpha_activity = 0.95  # >= 95% du volume attendu baseline par activité
+alpha_total    = 0.97  # >= 97% du volume attendu baseline global
 
-# Ordre des hausses : plus ELR0 élevé => majoration au moins aussi élevée
-delta_s_order = 0.0     # mettre p.ex. 0.002 (0,2 pt) pour un ordre strict croissant
+# Cohérence des hausses (ordre monotone sur l'ELR de base)
+# 0.0 = non strict ; par ex. 0.002 (= 0,2 point) pour ordre strict croissant
+delta_s_order = 0.0
 
-# Cible d'ELR global : par défaut "constante business" = somme(PP)/somme(PC) du portefeuille
+# Cible d'ELR global (par défaut : constante business = somme(PP)/somme(PC) à prix actuels)
 tau = float(df['prime_pure'].sum() / df['prime_commerciale'].sum())
 
-# -----------------------------
-# 1) Baseline pondérée EBM (s=0)
-# -----------------------------
-# Prépare l'input pour l'EBM au tarif actuel
+# Liste d'activités
+activities = sorted(df['activite'].unique().tolist())
+
+print(f"Paramètres : pas={step:.3f}, s_max={s_max:.3f}, K={K}, "
+      f"alpha_activity={alpha_activity:.3f}, alpha_total={alpha_total:.3f}, "
+      f"delta_s_order={delta_s_order:.3f}, tau={tau:.6f}")
+
+
+
+
+
+#####################################################
+
+# === Baseline EBM (aucune majoration) ===
+# On calcule les probabilités de conversion au prix actuel,
+# puis on agrège par activité le volume, la ressource et le coût attendus.
+
+# Entrées du modèle EBM au tarif actuel
 X0 = pd.DataFrame({
     'prime_commerciale': df['prime_commerciale'].astype(float),
-    'surafce': df['surafce'],              # garder tel quel: cohérent avec l'entraînement de ton EBM
+    'surafce': df['surafce'],
     'CA': df['CA'],
     'type_client': df['type_client'],
-    'reduction': df['reduction'].astype(float)
+    'reduction': df['reduction'].astype(float),
 })
 
+# Probabilités de conversion (supporte proba en 2 colonnes ou 1)
 proba0_raw = ebm_model.predict_proba(X0)
 proba0 = np.asarray(proba0_raw)
-# Gestion souple des sorties (2 colonnes proba classe 0/1 ou 1 colonne proba positive)
 if proba0.ndim == 2 and proba0.shape[1] >= 2:
     p0 = proba0[:, 1]
 else:
     p0 = proba0.reshape(-1)
 p0 = np.clip(p0, 0.0, 1.0)
 
+# Agrégats baseline
 df0 = df.copy()
 df0['p0'] = p0
-# Agrégats baseline par activité
 N0_by_act = df0.groupby('activite')['p0'].sum()
 R0_by_act = (df0['p0'] * df0['prime_commerciale']).groupby(df0['activite']).sum()
 C0_by_act = (df0['p0'] * df0['prime_pure']).groupby(df0['activite']).sum()
 ELR0_by_act = (C0_by_act / R0_by_act.replace(0.0, np.nan)).fillna(0.0)
 N0_tot = float(df0['p0'].sum())
 
-activities = sorted(df['activite'].unique().tolist())
+print("Baseline (extraits) :")
+display(pd.DataFrame({
+    'N0': N0_by_act, 'R0': R0_by_act, 'C0': C0_by_act, 'ELR0': ELR0_by_act
+}).reset_index().head())
+print(f"N0_tot (volume attendu global à s=0) : {N0_tot:.2f}")
 
-# -----------------------------
-# 2) Pré-agrégats EBM sur la grille s_levels
-# -----------------------------
-# Pour chaque niveau de hausse s, on recalcule les probabilités de conversion
-# puis on agrège par activité : N_i^k, R_i^k, C_i^k.
+
+
+
+
+
+###############################################################
+
+# === Pré-agrégats EBM sur la grille s_levels ===
+# Pour chaque niveau s, on recalcule la proba de conversion contrat par contrat,
+# et on agrège en N_{i}^k, R_{i}^k, C_{i}^k pour chaque activité i.
+
 N_ik, R_ik, C_ik = {}, {}, {}
+details_rows = []
 
 for k, s in enumerate(s_levels):
+    # Nouveau prix pour chaque contrat
     PC_new = df['prime_commerciale'].astype(float) * (1.0 + s)
+
+    # Re-prédiction EBM au nouveau prix
     Xk = pd.DataFrame({
         'prime_commerciale': PC_new,
         'surafce': df['surafce'],
         'CA': df['CA'],
         'type_client': df['type_client'],
-        'reduction': df['reduction'].astype(float)
+        'reduction': df['reduction'].astype(float),
     })
     proba_raw = ebm_model.predict_proba(Xk)
     proba = np.asarray(proba_raw)
@@ -84,11 +104,12 @@ for k, s in enumerate(s_levels):
         p = proba.reshape(-1)
     p = np.clip(p, 0.0, 1.0)
 
+    # Agrégats par activité
     tmp = pd.DataFrame({
         'activite': df['activite'],
         'p': p,
         'PC_new': PC_new,
-        'PP': df['prime_pure'].astype(float)
+        'PP': df['prime_pure'].astype(float),
     })
     N_k = tmp.groupby('activite')['p'].sum()
     R_k = (tmp['p'] * tmp['PC_new']).groupby(tmp['activite']).sum()
@@ -98,68 +119,92 @@ for k, s in enumerate(s_levels):
         N_ik[(a, k)] = float(N_k.get(a, 0.0))
         R_ik[(a, k)] = float(R_k.get(a, 0.0))
         C_ik[(a, k)] = float(C_k.get(a, 0.0))
+        details_rows.append({
+            'activite': a,
+            's': float(s),
+            'N': N_ik[(a, k)],
+            'R': R_ik[(a, k)],
+            'C': C_ik[(a, k)],
+            'ELR': (C_ik[(a, k)] / R_ik[(a, k)]) if R_ik[(a, k)] > 0 else 0.0
+        })
 
-# -----------------------------
-# 3) Construction du modèle MILP (PuLP)
-# -----------------------------
+details_grid = pd.DataFrame(details_rows)
+print("Vérification rapide :")
+display(details_grid.head())
+
+
+
+
+#######################################################################################
+
+
+# === Construction du MILP ===
 m = pulp.LpProblem("Majoration_Activites_Cible_ELR", pulp.LpMinimize)
 
-# Variables binaires x_{i,k} : choix du niveau s^k pour l'activité i
+# Variables binaires x_{i,k}: on choisit un unique palier par activité
 x = {(a, k): pulp.LpVariable(f"x_{a}_{k}", lowBound=0, upBound=1, cat="Binary")
      for a in activities for k in range(K)}
 
-# Variable t >= 0 : écart absolu à la cible ELR (|C_tot - tau*R_tot|)
+# Variable t >= 0 : écart absolu à la cible ELR globale |C_tot - tau * R_tot|
 t = pulp.LpVariable("t_abs_dev", lowBound=0, cat="Continuous")
 
-# Objectif : minimiser t
+# Objectif : minimiser l'écart à la cible ELR
 m += t
 
-# Un seul niveau par activité
+# 1) Un seul niveau par activité
 for a in activities:
     m += pulp.lpSum(x[(a, k)] for k in range(K)) == 1, f"one_level_{a}"
 
-# Expressions globales : N_tot, R_tot, C_tot
+# Expressions globales (R_tot, C_tot, N_tot)
 R_tot_expr = pulp.lpSum(x[(a, k)] * R_ik[(a, k)] for a in activities for k in range(K))
 C_tot_expr = pulp.lpSum(x[(a, k)] * C_ik[(a, k)] for a in activities for k in range(K))
 N_tot_expr = pulp.lpSum(x[(a, k)] * N_ik[(a, k)] for a in activities for k in range(K))
 
-# Proximité de la cible ELR : |C_tot - tau * R_tot| <= t
+# 2) Proximité de la cible ELR : |C_tot - tau * R_tot| <= t
 m += C_tot_expr - tau * R_tot_expr <= t, "ELR_target_pos"
 m += tau * R_tot_expr - C_tot_expr <= t, "ELR_target_neg"
 
-# Volume global minimal
-m += N_tot_expr >= alpha_total * N0_tot, "volume_global"
+# 3) Volume global minimal
+m += N_tot_expr >= alpha_total * float(N0_tot), "volume_global"
 
-# Volume minimal par activité + amélioration ELR_i
+# 4) Volume minimal par activité + amélioration ELR_i
 for a in activities:
-    # Volume par activité
-    m += pulp.lpSum(x[(a, k)] * N_ik[(a, k)] for k in range(K)) >= alpha_activity * float(N0_by_act.get(a, 0.0)), f"vol_act_{a}"
-    # ELR_i(s) <= ELR_i^0  ->  C_i(s) <= ELR_i^0 * R_i(s)
+    # Volume activité
+    m += pulp.lpSum(x[(a, k)] * N_ik[(a, k)] for k in range(K)) \
+         >= alpha_activity * float(N0_by_act.get(a, 0.0)), f"vol_act_{a}"
+    # ELR_i(s) <= ELR_i^0  <=>  C_i(s) <= ELR_i^0 * R_i(s)
     ELR0_a = float(ELR0_by_act.get(a, 0.0))
     m += pulp.lpSum(x[(a, k)] * C_ik[(a, k)] for k in range(K)) \
          <= ELR0_a * pulp.lpSum(x[(a, k)] * R_ik[(a, k)] for k in range(K)), f"elr_improve_{a}"
 
-# Ordre des hausses (cohérence) : trier activités par ELR0 croissant
+# 5) Ordre des hausses : si ELR0(u) <= ELR0(v) => s_u + delta <= s_v
 ord_acts = sorted(activities, key=lambda a: float(ELR0_by_act.get(a, 0.0)))  # meilleur -> pire
-for u, v in zip(ord_acts, ord_acts[1:]):  # s_u + delta <= s_v
+for u, v in zip(ord_acts, ord_acts[1:]):
     m += pulp.lpSum(s_levels[k] * x[(u, k)] for k in range(K)) + delta_s_order \
          <= pulp.lpSum(s_levels[k] * x[(v, k)] for k in range(K)), f"order_{u}_to_{v}"
 
-# -----------------------------
-# 4) Résolution
-# -----------------------------
+print("Modèle MILP construit.")
+
+
+
+# === Résolution ===
 status = m.solve(pulp.PULP_CBC_CMD(msg=False))
 status_str = pulp.LpStatus[status]
-if status_str not in ("Optimal", "Feasible"):
-    raise RuntimeError(f"Pas de solution réalisable ({status_str}). "
-                       f"Assouplir alpha_activity/alpha_total ou delta_s_order ou ajuster tau.")
+print("Statut du solveur :", status_str)
 
-# -----------------------------
-# 5) Extraction des résultats
-# -----------------------------
+if status_str not in ("Optimal", "Feasible"):
+    raise RuntimeError(
+        "Pas de solution réalisable. "
+        "Assouplis éventuellement alpha_activity/alpha_total, delta_s_order, ou ajuste la cible tau."
+    )
+
+
+#############################################################
+
+# === Extraction & synthèse ===
 rows = []
 for a in activities:
-    # niveau choisi = argmax_k x_{a,k}
+    # palier choisi : argmax_k x_{a,k}
     k_star = max(range(K), key=lambda k: float(pulp.value(x[(a, k)]) or 0.0))
     s_star = float(s_levels[k_star])
     N_star = float(N_ik[(a, k_star)])
@@ -175,10 +220,10 @@ for a in activities:
         "C_opt": C_star,
         "ELR_opt": ELR_star,
         "ELR0_act": float(ELR0_by_act.get(a, 0.0)),
-        "N0_act": float(N0_by_act.get(a, 0.0))
+        "N0_act": float(N0_by_act.get(a, 0.0)),
     })
 
-res_act = pd.DataFrame(rows).sort_values(["s_opt","activite"]).reset_index(drop=True)
+res_act = pd.DataFrame(rows).sort_values(["s_opt", "activite"]).reset_index(drop=True)
 
 R_tot_opt = float(pulp.value(R_tot_expr))
 C_tot_opt = float(pulp.value(C_tot_expr))
@@ -189,7 +234,7 @@ t_val = float(pulp.value(t))
 resume = {
     "statut": status_str,
     "tau_cible": tau,
-    "t_deviation": t_val,
+    "t_deviation": t_val,      # |C_tot - tau*R_tot| à l’optimum
     "N0_tot": float(N0_tot),
     "N_tot_opt": N_tot_opt,
     "R_tot_opt": R_tot_opt,
@@ -200,18 +245,24 @@ resume = {
     "delta_s_order": delta_s_order,
     "pas_grille": step,
     "nb_niveaux": K,
-    "nb_activites": len(activities)
+    "nb_activites": len(activities),
 }
 
-# -----------------------------
-# 6) Affichage des résultats
-# -----------------------------
 print("=== Majoration optimale par activité ===")
-print(res_act.to_string(index=False))
-
+display(res_act)
 print("\n=== Résumé global ===")
 for k, v in resume.items():
-    if isinstance(v, float):
-        print(f"{k}: {v:.6f}")
-    else:
-        print(f"{k}: {v}")
+    print(f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}")
+
+
+
+
+
+
+
+
+
+
+
+
+
