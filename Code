@@ -1,74 +1,23 @@
-# DANS LA FONCTION : def analyze_results(...)
-    # ... (tout votre code d'analyse de texte et de calcul de score)
+# AJOUTEZ CE BLOC :
+    if best_solution:
+        # Appeler le nouveau plot de convergence
+        plot_convergence_history(logbook)
+        
+        # Appeler votre fonction d'analyse (qui contient maintenant les 3 autres plots)
+        optimal_majorations = analyze_results(best_solution, df_data, model_ebm,
+                                              activite_index_map, LISTE_ACTIVITES,
+                                              s_vp, s_autre, df_primes_activite)
 
-    print(f"\nScore Recalculé : {score_recalcule:,.0f} (Doit être égal au meilleur score)")
+        print("\n--- PROCESSUS TERMINÉ ---")
+        if optimal_majorations:
+            print("Majorations optimales trouvées :", optimal_majorations)
+            
+        # AJOUTEZ CETTE LIGNE pour afficher les fenêtres de graphiques
+        print("\nAffichage des graphiques...")
+        plt.show()
+    else:
+        print("\n--- PROCESSUS ÉCHOUÉ (Pas de solution trouvée) ---")
 
-    # --- DÉBUT DU CODE À AJOUTER POUR LES GRAPHIQUES ---
-    
-    print("\nGénération des graphiques d'analyse...")
-
-    # --- Graphique 1: Majoration par Activité ---
-    df_plot_maj = pd.DataFrame.from_dict(dict_majorations_optimales, orient='index', columns=['Majoration'])
-    df_plot_maj['Activité'] = df_plot_maj.index
-    df_plot_maj['Groupe'] = df_plot_maj['Activité'].apply(lambda x: 'S_vp (Rentable)' if x in s_vp else 'S_autre (À Risque)')
-    
-    plt.figure(figsize=(12, 7))
-    barplot = sns.barplot(x='Activité', y='Majoration', hue='Groupe', data=df_plot_maj, dodge=False)
-    barplot.yaxis.set_major_formatter(PercentFormatter(1.0))
-    plt.title("Majoration Optimale par Activité", fontsize=16)
-    plt.ylabel("Majoration Appliquée", fontsize=12)
-    plt.xlabel("Activité", fontsize=12)
-    plt.legend(title='Groupe de Risque')
-    plt.savefig("2_majorations_optimales.png")
-    print("-> '2_majorations_optimales.png' sauvegardé.")
-
-    # --- Graphique 2: Impact ELR ---
-    # Ajout de l'ELR actuel pour comparaison
-    # Note : 'COPTTC' est le nom de votre prime commerciale
-    df_data['elr_actuel_calc'] = df_data['prime_pure'] / (df_data['COPTTC'] + 1e-6)
-    df_final['elr_actuel'] = df_data['elr_actuel_calc']
-    
-    df_risque_plot = df_final[df_final['activite_reduite'].isin(s_autre)]
-    
-    plt.figure(figsize=(12, 7))
-    # Assurez-vous qu'il y a des données à tracer
-    if not df_risque_plot.empty:
-        sns.histplot(df_risque_plot['elr_actuel'].clip(0, 2), color="orange", label="ELR Actuel (Avant)", kde=True, stat="density", element="step", fill=True, alpha=0.3)
-        sns.histplot(df_risque_plot['elr_sentinelle'].clip(0, 2), color="green", label="ELR Futur (Après)", kde=True, stat="density", element="step", fill=True, alpha=0.3)
-    
-    plt.axvline(SEUIL_ELR_RISQUE_LOCAL, color='red', linestyle='--', linewidth=2, label=f"Seuil Risque ({SEUIL_ELR_RISQUE_LOCAL:.0%})")
-    plt.title(f"Impact de l'Optimisation sur l'ELR (Activités S_autre)", fontsize=16)
-    plt.xlabel("ELR (Prime Pure / Prime Commerciale)", fontsize=12)
-    plt.ylabel("Densité des Contrats", fontsize=12)
-    plt.legend()
-    plt.xlim(0, 2)
-    plt.savefig("3_impact_elr.png")
-    print("-> '3_impact_elr.png' sauvegardé.")
-
-    # --- Graphique 3: Vue Portefeuille (Risque vs Profit) ---
-    df_scatter = df_final.sample(n=min(len(df_final), 2000)) # Échantillonner
-    
-    plt.figure(figsize=(14, 8))
-    sns.scatterplot(
-        data=df_scatter,
-        x='elr_sentinelle',
-        y='profit_futur_attendu',
-        hue='activite_reduite',
-        size='prime_ajustee',
-        sizes=(50, 500),
-        alpha=0.7
-    )
-    plt.axvline(SEUIL_ELR_RISQUE_LOCAL, color='red', linestyle='--', linewidth=2, label=f"Seuil Risque ({SEUIL_ELR_RISQUE_LOCAL:.0%})")
-    plt.axhline(0, color='black', linestyle='--', linewidth=1)
-    plt.title("Vue Portefeuille Optimisé (Échantillon)", fontsize=16)
-    plt.xlabel("Risque (ELR Futur)", fontsize=12)
-    plt.ylabel("Profit Attendu (€)", fontsize=12)
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    plt.grid(True, linestyle=':', alpha=0.6)
-    plt.xlim(-0.1, 2)
-    plt.savefig("4_portefeuille_risque_profit.png", bbox_inches='tight')
-    print("-> '4_portefeuille_risque_profit.png' sauvegardé.")
-    
-    # --- FIN DU CODE À AJOUTER ---
-    
-    return dict_majorations_optimales
+# Point d'entrée du script
+if __name__ == "__main__":
+    main()
