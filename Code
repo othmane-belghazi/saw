@@ -1,465 +1,472 @@
+# --- OPTIMISATION TARIFAIRE GUIDÉE - CODE COMPLET ---
+
 import pandas as pd
 import numpy as np
 import random
-from deap import base, creator, tools, algorithms
 import warnings
+
+# Imports pour l'Algorithme Génétique (DEAP)
+from deap import base, creator, tools, algorithms
 
 warnings.filterwarnings('ignore')
 
 # ----------------------------------------------------------------------
-# 1. paramètres globaux de l'optimisation
+# PARTIE 1 : PARAMÈTRES GLOBAUX (La "Tour de Contrôle")
 # ----------------------------------------------------------------------
+print("Initialisation des paramètres globaux...")
 
-print("--- initialisation des paramètres ---")
+# --- 1. Paramètres de Rentabilité et Risque ---
+SEUIL_RENTABLE_GLOBAL = 0.50  # 50% (pour définir s_vp et s_autre) - Reverted to initial value
+SEUIL_ELR_RISQUE_LOCAL = 0.85   # 85% (le 'τ' pour la pénalité G_risque) - Reverted to initial value
 
-# seuils de rentabilité
-seuil_rentable_global = 0.40  # 40% (pour définir s_vp et s_autre)
-seuil_elr_risque_local = 0.80   # 80% (le 'τ' pour la pénalité g_risque)
+# --- 2. Cibles et Contraintes Stratégiques ---
+CIBLE_MAJORATION_MOYENNE = 0.04  # 4% (Votre 'X%')
+SEUIL_VOLUME_MIN = 0.97          # 97% (perte max de 3%) - Reverted to initial value
 
-# cibles et contraintes
-cible_majoration_moyenne = 0.035  # 3.5% (votre 'x%')
-seuil_volume_min = 0.97          # 97% (perte max de 3%)
+# --- 3. Poids des Pénalités (w1, w2) ---
+# Using the optimal weights identified from previous analysis
+POIDS_W1_RISQUE = 1_000  # Optimal weight for G_risque
+POIDS_W2_CIBLE = 1_500_000      # Optimal weight for G_cible
 
-# poids des pénalités (à ajuster selon les priorités métier)
-poids_w1_risque = 1_000_000   # pénalité très forte pour le risque
-poids_w2_cible = 500_000      # pénalité forte pour l'écart à la cible
+# --- 4. Paramètres de l'Algorithme Génétique ---
+GA_NGEN = 50      # Nombre de générations - Reverted to initial value
+GA_NPOP = 100     # Taille de la population - Reverted to initial value
+GA_CXPB = 0.6     # Probabilité de croisement
+GA_MUTPB = 0.3    # Probabilité de mutation
 
-# paramètres de l'algorithme génétique
-ga_ngen = 50      # nombre de générations
-ga_npop = 100     # taille de la population
-ga_cxpb = 0.6     # probabilité de croisement (crossover)
-ga_mutpb = 0.3    # probabilité de mutation
+# --- 5. Features du Modèle EBM ---
+# Doit correspondre EXACTEMENT à ce que le modèle a appris
+MODEL_FEATURES_BASE = [
+    'surface_bins', 'chiffre_affaires_bins', 'activite_reduite',
+    'capital_incendie_bins', 'type_client', 'type_occupation_local', 'reduction'
+]
+# La prime est gérée séparément
+MODEL_PRIME_FEATURE = 'COPTTC'
 
-# ----------------------------------------------------------------------
-# 2. définition des domaines de majoration (contrainte c1, c2)
-# ----------------------------------------------------------------------
 
 def get_domaines_par_activite(df, list_activites):
     """
-    calcule l'elr actuel de chaque activité, les sépare en groupes (s_vp, s_autre)
-    et leur assigne un domaine de majoration discret.
-    utilise les noms de colonnes 'prime pure' et 'prime commerciale'.
+    Calcule l'ELR actuel de chaque activité (prime_pure / prime_commercialle)
+    et leur assigne un domaine de majoration discret (C1, C2).
     """
-    print("\n1. calcul des elr actuels et définition des domaines...")
+    print("\nCalcul des ELR actuels et définition des domaines...")
 
-    # calcul de l'elr actuel par activité
     try:
-        agg = df.groupby('activite')[['prime pure', 'prime commerciale']].sum()
-        agg['elr_actuel'] = agg['prime pure'] / agg['prime commerciale']
-    except keyerror as e:
-        print(f"erreur: colonne manquante pour le calcul de l'elr. vérifiez {e}")
-        return none, none, none, none, none
-        
+        # 'COPTTC' est le nom de la colonne de prime commerciale après renommage dans main()
+        agg = df.groupby('activite_reduite')[['prime_pure', 'COPTTC']].sum()
+        agg['elr_actuel'] = agg['prime_pure'] / agg['COPTTC']
+    except KeyError as e:
+        print(f"ERREUR: Colonne manquante pour le calcul de l'ELR. Vérifiez {e}")
+        return None, None, None, None, None
+
     elr_par_activite = agg['elr_actuel'].to_dict()
 
-    # création des domaines discrets
-    # [0.0%, 0.1%, ..., 1.0%]
+    # Domaines discrets [0.0%, 0.1%, ..., 1.0%]
     dom_vp = np.round(np.arange(0.0, 0.0101, 0.001), 3)
-    # [2.0%, 2.1%, ..., 8.0%]
+    # Domaines discrets [2.0%, 2.1%, ..., 8.0%]
     dom_autre = np.round(np.arange(0.02, 0.0801, 0.001), 3)
 
     domaines_map = {}
-    s_vp = []
-    s_autre = []
+    s_vp = []       # Set des activités "très rentables"
+    s_autre = []    # Set des "autres" activités
 
-    # map pour l'index du vecteur (ex: 'auto' -> 0, 'habitation' -> 1)
+    # Map pour l'index du vecteur (ex: 'auto' -> 0)
     activite_index_map = {activite: i for i, activite in enumerate(list_activites)}
 
     for activite in list_activites:
-        if activite not in elr_par_activite:
-            print(f"attention: activité '{activite}' présente dans les données mais sans prime. elr non calculé.")
+        if activite not in elr_par_activite: # Handle cases where an activity might not be in the simulated data
+            print(f"ATTENTION: Activité '{activite}' non trouvée dans les données. Elle sera ignorée.")
             continue
-            
+
         elr = elr_par_activite[activite]
-        if elr < seuil_rentable_global:
+        if elr < SEUIL_RENTABLE_GLOBAL:
             domaines_map[activite] = dom_vp
             s_vp.append(activite)
-            print(f"-> activité '{activite}' (elr={elr:.1%}) : très rentable (s_vp). domaine [0%-1%]")
+            print(f"-> Activité '{activite}' (ELR={elr:.1%}) : Très Rentable (S_vp). Domaine [0%-1%]")
         else:
             domaines_map[activite] = dom_autre
             s_autre.append(activite)
-            print(f"-> activité '{activite}' (elr={elr:.1%}) : autre (s_autre). domaine [2%-8%]")
+            print(f"-> Activité '{activite}' (ELR={elr:.1%}) : Autre (S_autre). Domaine [2%-8%]")
 
-    return domaines_map, activite_index_map, s_vp, s_autre, agg[['prime commerciale']]
+    return domaines_map, activite_index_map, s_vp, s_autre, agg[['COPTTC']]
 
 # ----------------------------------------------------------------------
-# 3. fonction d'évaluation (cœur de l'optimiseur)
+# PARTIE 3 : FONCTION D'ÉVALUATION (Cœur de l'Optimiseur)
 # ----------------------------------------------------------------------
 
-def get_predictions_vectorisees(df, dict_majorations, model_ebm, model_features):
+def get_predictions_vectorisees(df, dict_majorations, model_ebm):
     """
-    applique les majorations, appelle le modèle ebm, et calcule profit/elr attendus.
+    Applique les majorations, gère le renommage de la prime pour l'EBM,
+    et prédit la rétention ainsi que les métriques futures.
     """
     df_pred = df.copy()
 
-    # 1. appliquer la majoration de l'activité à chaque contrat
-    df_pred['majoration_pct'] = df_pred['activite'].map(dict_majorations)
+    # 1. Appliquer la majoration de l'activité à chaque contrat
+    df_pred['majoration_pct'] = df_pred['activite_reduite'].map(dict_majorations)
 
-    # 2. calculer la 'prime ajuset' (nouvelle prime commerciale)
-    df_pred['prime_ajuset'] = df_pred['prime commerciale'] * (1 + df_pred['majoration_pct'])
+    # 2. Calculer la 'prime_ajustee'
+    df_pred['prime_ajustee'] = df_pred['COPTTC'] * (1 + df_pred['majoration_pct'])
 
-    # 3. préparer les features pour le modèle ebm
-    features_pour_prediction = model_features + ['prime_ajuset']
-    x_features = df_pred[features_pour_prediction]
+    # 3. Préparer les features pour le modèle EBM
+    # On prend les features de base
+    x_features = df_pred[MODEL_FEATURES_BASE].copy()
+    # On ajoute la prime ajustée, MAIS sous le nom que le modèle attend
+    x_features[MODEL_PRIME_FEATURE] = df_pred['prime_ajustee']
+    df_pred['retention_pred'] = model_ebm.predict_proba(x_features)[:, 1]
 
-    # 4. appeler le modèle de rétention (model_ebm)
-    # on suppose que .predict_proba() renvoie [prob_classe_0, prob_classe_1]
-    try:
-        df_pred['retention_pred'] = model_ebm.predict_proba(x_features)[:, 1]
-    except Exception as e:
-        print(f"erreur lors de la prédiction avec model_ebm: {e}")
-        # en cas d'erreur, on retourne une rétention nulle pour pénaliser
-        df_pred['retention_pred'] = 0.0
-
-    # 5. calculer le profit et l'elr futurs
-    # profit = (prime future - coût)
-    df_pred['profit_futur_contrat'] = (df_pred['prime_ajuset'] - df_pred['prime pure'])
-    # profit attendu = profit * probabilité de rétention
+    # 5. Calculer le profit et l'ELR futurs
+    df_pred['profit_futur_contrat'] = (df_pred['prime_ajustee'] - df_pred['prime_pure'])
     df_pred['profit_futur_attendu'] = df_pred['profit_futur_contrat'] * df_pred['retention_pred']
 
-    # elr sentinelle (pour g_risque)
-    df_pred['elr_sentinelle'] = df_pred['prime pure'] / df_pred['prime_ajuset']
+    # ELR Sentinelle (pour G_risque)
+    # Ajout d'un epsilon pour éviter la division par zéro si prime = 0
+    df_pred['elr_sentinelle'] = df_pred['prime_pure'] / (df_pred['prime_ajustee'] + 1e-6)
 
     return df_pred
 
 
-def evaluate_solution(vector_nu, df_data, activite_index_map, s_autre, df_primes_activite, 
-                      model_ebm, model_features, list_activites):
+def evaluate_solution(vector_nu, df_data, model_ebm, activite_index_map,
+                      list_activites, s_autre, df_primes_activite):
     """
-    c'est la fonction objectif que deap va appeler.
-    prend un vecteur de majorations et retourne un score unique.
+    C'est LA fonction objectif que DEAP va appeler.
+    Prend un vecteur de majorations et retourne un score unique.
     """
 
-    # convertir le vecteur [0.05, 0.01, ...] en {'auto': 0.05, 'habitation': 0.01, ...}
+    # Convertir le vecteur [0.05, 0.01, ...] en {'auto': 0.05, ...}
     dict_majorations = {act: vector_nu[idx] for act, idx in activite_index_map.items()}
 
-    # 1. obtenir toutes les prédictions (étape la plus longue)
-    df_pred = get_predictions_vectorisees(df_data, dict_majorations, model_ebm, model_features)
+    # 1. Obtenir toutes les prédictions (étape la plus longue)
+    df_pred = get_predictions_vectorisees(df_data, dict_majorations, model_ebm)
 
-    # 2. vérifier contrainte dure c3: volume global
+    # 2. Vérifier Contrainte Dure C3: Volume Global
     volume_attendu = df_pred['retention_pred'].sum()
     volume_total = len(df_pred)
 
-    if volume_attendu < (seuil_volume_min * volume_total):
-        return -9e18,  # pénalité massive, solution invalide. (deap attend un tuple)
+    if volume_attendu < (SEUIL_VOLUME_MIN * volume_total):
+        return -9e18,  # Pénalité massive, solution invalide (DEAP attend un tuple)
 
-    # 3. calcul des 3 objectifs
+    # 3. Calcul des 3 composantes du score
 
-    # f_profit: profit total attendu
-    f_profit = df_pred['profit_futur_attendu'].sum()
+    # F_profit: Profit total attendu
+    F_profit = df_pred['profit_futur_attendu'].sum()
 
-    # g_cible: écart à la majoration moyenne pondérée x%
-    num = sum(dict_majorations[act] * df_primes_activite.loc[act, 'prime commerciale'] for act in list_activites)
-    den = df_primes_activite['prime commerciale'].sum()
-    maj_moy_ponderee = num / den
-    g_cible = (maj_moy_ponderee - cible_majoration_moyenne)**2
+    # G_cible: Écart à la majoration moyenne pondérée X%
+    primes_totales = df_primes_activite['COPTTC'].sum() # Corrected column name
+    if primes_totales > 0:
+        num = sum(dict_majorations[act] * df_primes_activite.loc[act, 'COPTTC'] for act in list_activites)
+        maj_moy_ponderee = num / primes_totales
+    else:
+        maj_moy_ponderee = 0
 
-    # g_risque: pénalité sur les activités non rentables
-    df_pred_risque = df_pred[df_pred['activite'].isin(s_autre)]
-    
-    # pénalité quadratique sur le "dépassement" du seuil elr local
-    # (votre formule g1 initiale était plus complexe, ceci est une approximation efficace)
-    overshoot_elr = (df_pred_risque['elr_sentinelle'] - seuil_elr_risque_local).clip(lower=0)
-    g_risque = (overshoot_elr**2).sum()
+    G_cible = (maj_moy_ponderee - CIBLE_MAJORATION_MOYENNE)**2
 
-    # 4. score final
-    score_final = f_profit - (poids_w1_risque * g_risque) - (poids_w2_cible * g_cible)
+    # G_risque: Pénalité sur les activités non rentables
+    df_pred_risque = df_pred[df_pred['activite_reduite'].isin(s_autre)] # Corrected column name
 
-    return score_final,  # deap attend un tuple
+    # Pénalité quadratique sur le "dépassement" du seuil ELR local
+    overshoot_elr_final = (df_pred_risque['elr_sentinelle'] - SEUIL_ELR_RISQUE_LOCAL).clip(lower=0)
+    G_risque = (overshoot_elr_final**2).sum()
+
+    # 4. Score Final
+    score_final = F_profit - (POIDS_W1_RISQUE * G_risque) - (POIDS_W2_CIBLE * G_cible)
+
+    return score_final,  # DEAP attend un tuple
 
 # ----------------------------------------------------------------------
-# 4. configuration de l'algorithme génétique (deap)
+# PARTIE 4 : CONFIGURATION DE L'ALGORITHME GÉNÉTIQUE (DEAP)
 # ----------------------------------------------------------------------
 
-def setup_deap(domaines_map, activite_index_map, df_data, s_autre, df_primes_activite, 
-               model_ebm, model_features, list_activites):
+def setup_deap(toolbox, k_activites, list_activites, domaines_map):
     """
-    configure tous les opérateurs de l'algorithme génétique (deap).
+    Configure tous les opérateurs de l'algorithme génétique (DEAP).
     """
-    print("\n2. configuration de l'algorithme génétique (deap)...")
-    
-    k_activites = len(list_activites)
+    print("\nConfiguration de l'algorithme génétique (DEAP)...")
 
-    # 1. initialisation de deap
-    creator.create("fitnessmax", base.fitness, weights=(1.0,))
-    creator.create("individual", list, fitness=creator.fitnessmax)
+    # 1. Initialisation de DEAP
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
 
-    toolbox = base.toolbox()
+    # 2. Création des gènes et individus (Contraintes C1, C2)
 
-    # 2. création des gènes et individus (contraintes c1, c2)
-    def create_gene(activity_index):
-        activite = list_activites[activity_index]
-        domaine = domaines_map[activite]
-        return random.choice(domaine)
+    # A gene is a majoration. It MUST respect the domain of its activity.
+    # The i-th gene in the individual corresponds to list_activites[i]
+    def init_individual_genes():
+        individual_genes = []
+        for i in range(k_activites):
+            activite = list_activites[i]
+            domaine = domaines_map[activite]
+            individual_genes.append(random.choice(domaine))
+        return individual_genes
 
-    def create_individual():
-        return creator.individual(create_gene(i) for i in range(k_activites))
+    # An "individual" is a vector of K genes, where individual[i] is the majoration for list_activites[i]
+    toolbox.register("individual", tools.initIterate, creator.Individual, init_individual_genes)
 
-    toolbox.register("individual", create_individual)
-    toolbox.register("population", tools.initrepeat, list, toolbox.individual)
+    # A "population" is a list of individuals
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    # 3. définition des opérateurs génétiques
+    # 3. Définition des Opérateurs Génétiques
 
-    # fonction d'évaluation (avec arguments fixes)
-    toolbox.register("evaluate", evaluate_solution,
-                     df_data=df_data,
-                     activite_index_map=activite_index_map,
-                     s_autre=s_autre,
-                     df_primes_activite=df_primes_activite,
-                     model_ebm=model_ebm,
-                     model_features=model_features,
-                     list_activites=list_activites)
+    # Fonction d'évaluation (déjà enregistrée dans le 'main')
 
-    toolbox.register("mate", tools.cxtwopoint)
+    # Opérateur de croisement
+    toolbox.register("mate", tools.cxTwoPoint)
 
+    # Opérateur de mutation (personnalisé pour respecter les domaines)
     def custom_mutation(individual, indpb=0.1):
         for i in range(len(individual)):
             if random.random() < indpb:
-                individual[i] = create_gene(i)  # re-tire dans le bon domaine
+                activite = list_activites[i] # Get the specific activity for this gene position
+                domaine = domaines_map[activite]
+                individual[i] = random.choice(domaine)  # Re-sample from the correct domain
         return individual,
 
-    toolbox.register("mutate", custom_mutation, indpb=1.0/k_activites)
-    toolbox.register("select", tools.seltournament, tournsize=3)
+    toolbox.register("mutate", custom_mutation, indpb=1.0/k_activites) # Pass list_activites and domaines_map to custom_mutation is not needed as they are in scope
 
-    print("-> configuration deap terminée.")
+    # Opérateur de sélection
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    print("-> Configuration DEAP terminée.")
     return toolbox
 
 # ----------------------------------------------------------------------
-# 5. exécution et analyse
+# PARTIE 5 : EXÉCUTION ET ANALYSE
 # ----------------------------------------------------------------------
 
-def run_optimization(toolbox):
+def run_optimization(toolbox, k_activites):
     """
-    lance l'algorithme génétique et retourne la meilleure solution.
+    Lance l'algorithme génétique et retourne la meilleure solution.
     """
-    print(f"\n3. lancement de l'optimisation (population={ga_npop}, générations={ga_ngen})...")
+    print(f"\nLancement de l'optimisation (Population={GA_NPOP}, Générations={GA_NGEN})...")
 
-    pop = toolbox.population(n=ga_npop)
-    hof = tools.halloffame(1) # hall of fame pour garder le meilleur
-    
-    stats = tools.statistics(lambda ind: ind.fitness.values)
+    pop = toolbox.population(n=GA_NPOP)
+    hof = tools.HallOfFame(1) # Hall of Fame pour garder le meilleur
+
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
     stats.register("avg", np.mean)
     stats.register("std", np.std)
     stats.register("min", np.min)
     stats.register("max", np.max)
 
-    pop, log = algorithms.easimple(
+    # Lancement de l'algorithme
+    pop, log = algorithms.eaSimple(
         pop,
         toolbox,
-        cxpb=ga_cxpb,
-        mutpb=ga_mutpb,
-        ngen=ga_ngen,
+        cxpb=GA_CXPB,
+        mutpb=GA_MUTPB,
+        ngen=GA_NGEN,
         stats=stats,
         halloffame=hof,
-        verbose=True
+        verbose=True  # Affiche la progression
     )
 
-    print("-> optimisation terminée.")
-    return hof[0] # retourne le meilleur individu
+    print("-> Optimisation terminée.")
+    if len(hof) == 0:
+        print("ERREUR: Aucune solution valide n'a été trouvée (le HallOfFame est vide).")
+        print("Cela arrive souvent si la contrainte C3 (Volume) est trop stricte.")
+        return None
+
+    return hof[0] # Retourne le meilleur individu
 
 
-def analyze_results(best_solution_vector, df_data, activite_index_map, s_vp, s_autre, 
-                    df_primes_activite, model_ebm, model_features, list_activites):
+def analyze_results(best_solution_vector, df_data, model_ebm, activite_index_map,
+                    list_activites, s_vp, s_autre, df_primes_activite):
     """
-    affiche un rapport détaillé de la solution optimale trouvée.
+    Affiche un rapport détaillé de la solution optimale trouvée.
     """
-    print("\n--- résultat de l'optimisation ---")
+    if best_solution_vector is None:
+        print("Analyse annulée (pas de solution).")
+        return None
+
+    print("\n--- RÉSULTAT DE L'OPTIMISATION ---")
 
     best_score = best_solution_vector.fitness.values[0]
-    print(f"\nmeilleur score global trouvé : {best_score:,.0f}")
-    print("\nmeilleur vecteur de majoration (ν*) :\n")
+    print(f"\nMeilleur Score Global Trouvé : {best_score:,.0f}")
+    print("\nMeilleur Vecteur de Majoration (ν*) :\n")
 
     dict_majorations_optimales = {}
     for i, activite in enumerate(list_activites):
         majoration = best_solution_vector[i]
         dict_majorations_optimales[activite] = majoration
-        domaine_type = "(s_vp)" if activite in s_vp else "(s_autre)"
-        print(f"  - activité '{activite}' {domaine_type.ljust(10)}: {majoration:.1%}")
+        domaine_type = "(S_vp)" if activite in s_vp else "(S_autre)"
+        print(f"  - Activité '{activite}' {domaine_type.ljust(10)}: {majoration:.1%}")
 
-    print("\n--- analyse de la solution optimale ---")
+    # --- Analyse détaillée de la solution optimale ---
+    print("\n--- Analyse de la Solution Optimale ---")
 
-    df_final = get_predictions_vectorisees(df_data, dict_majorations_optimales, model_ebm, model_features)
+    df_final = get_predictions_vectorisees(df_data, dict_majorations_optimales, model_ebm)
 
+    # Vérification Contrainte Volume
     volume_attendu_final = df_final['retention_pred'].sum()
     volume_total_final = len(df_final)
     pct_retenu = volume_attendu_final / volume_total_final
-    print(f"\ncontrainte c3 (volume) : {pct_retenu:.2%} (seuil: {seuil_volume_min:.2%})")
-    if pct_retenu < seuil_volume_min:
-        print("attention: la contrainte de volume n'est pas respectée !")
+    print(f"\nContrainte C3 (Volume) : {pct_retenu:.2%} (Seuil: {SEUIL_VOLUME_MIN:.2%})")
+    if pct_retenu < SEUIL_VOLUME_MIN:
+        print("ATTENTION: La contrainte de volume est respectée de justesse ou non.")
     else:
-        print("ok: la contrainte de volume est respectée.")
+        print("OK: La contrainte de volume est respectée.")
 
-    f_profit_final = df_final['profit_futur_attendu'].sum()
+    # Calcul des composantes du score
+    F_profit_final = df_final['profit_futur_attendu'].sum()
 
-    num_final = sum(dict_majorations_optimales[act] * df_primes_activite.loc[act, 'prime commerciale'] for act in list_activites)
-    den_final = df_primes_activite['prime commerciale'].sum()
-    maj_moy_ponderee_final = num_final / den_final
-    g_cible_final = (maj_moy_ponderee_final - cible_majoration_moyenne)**2
+    primes_totales_final = df_primes_activite['COPTTC'].sum() # Corrected column name
+    num_final = sum(dict_majorations_optimales[act] * df_primes_activite.loc[act, 'COPTTC'] for act in list_activites) # Corrected column name
+    maj_moy_ponderee_final = num_final / primes_totales_final
+    G_cible_final = (maj_moy_ponderee_final - CIBLE_MAJORATION_MOYENNE)**2
 
-    df_pred_risque_final = df_final[df_final['activite'].isin(s_autre)]
-    overshoot_elr_final = (df_pred_risque_final['elr_sentinelle'] - seuil_elr_risque_local).clip(lower=0)
-    g_risque_final = (overshoot_elr_final**2).sum()
+    df_pred_risque_final = df_final[df_final['activite_reduite'].isin(s_autre)] # Corrected column name
+    overshoot_elr_final = (df_pred_risque_final['elr_sentinelle'] - SEUIL_ELR_RISQUE_LOCAL).clip(lower=0)
+    G_risque_final = (overshoot_elr_final**2).sum()
 
-    score_recalcule = f_profit_final - (poids_w1_risque * g_risque_final) - (poids_w2_cible * g_cible_final)
+    score_recalcule = F_profit_final - (POIDS_W1_RISQUE * G_risque_final) - (POIDS_W2_CIBLE * G_cible_final)
 
-    print("\ncomposantes du score :")
-    print(f"  f_profit (profit) : {f_profit_final:,.0f}")
-    print(f"  g_cible (pénalité cible) : {g_cible_final:.8f}")
-    print(f"    -> majoration moyenne : {maj_moy_ponderee_final:.2%} (cible: {cible_majoration_moyenne:.2%})")
-    print(f"  g_risque (pénalité risque) : {g_risque_final:,.2f}")
+    print("\nComposantes du Score :")
+    print(f"  F_profit (Profit) : {F_profit_final:,.0f}")
+    print(f"  G_cible (Pénalité Cible) : {G_cible_final:.8f}")
+    print(f"    -> Majoration Moyenne : {maj_moy_ponderee_final:.2%} (Cible: {CIBLE_MAJORATION_MOYENNE:.2%})")
+    print(f"  G_risque (Pénalité Risque) : {G_risque_final:,.2f}")
     if len(df_pred_risque_final) > 0:
-        print(f"    -> elr moyen (s_autre) : {df_pred_risque_final['elr_sentinelle'].mean():.2%}")
-    
-    print(f"\nscore recalculé : {score_recalcule:,.0f} (doit être égal au meilleur score)")
-    
+        print(f"    -> ELR moyen (S_autre) : {df_pred_risque_final['elr_sentinelle'].mean():.2%}")
+
+    print(f"\nScore Recalculé : {score_recalcule:,.0f} (Doit être égal au meilleur score)")
+
     return dict_majorations_optimales
 
 # ----------------------------------------------------------------------
-# 6. fonction principale (orchestrateur)
+# PARTIE 6 : ORCHESTRATION (Point d'entrée principal)
 # ----------------------------------------------------------------------
+def main():
+    print("--- DÉBUT DU PROCESSUS D'OPTIMISATION ---")
 
-def main_optimization(df_data, model_ebm):
-    """
-    fonction principale qui orchestre tout le processus d'optimisation.
-    
-    :param df_data: dataframe pandas contenant vos données (avec les colonnes en minuscule)
-    :param model_ebm: votre objet modèle ebm pré-entraîné (type scikit-learn)
-    :return: dict des majorations optimales par activité
-    """
-    
-    print("lancement du processus d'optimisation...")
-    
-    # 1. valider les colonnes et extraire les informations
-    model_features = ['activite', 'surface', 'ca', 'local', 'type_client', 'reduction', 'capital_incendie']
-    required_cols = model_features + ['numcnt', 'prime pure', 'prime commerciale']
-    
+    # ------------------------------------------------------------------
+    # --- 1. CHARGEMENT DES DONNÉES ET MODÈLE ---
+    # ------------------------------------------------------------------
+
+    # --- INSTRUCTIONS: CHARGEZ VOS DONNÉES ET VOTRE MODÈLE ICI ---
+    # Assurez-vous que votre DataFrame 'df_data' contient les colonnes suivantes:
+    # 'prime_pure', 'prime_commercialle' (sera renommée en 'COPTTC'), 'code activite' (sera renommée en 'activite_reduite'),
+    # et toutes les features listées dans MODEL_FEATURES_BASE.
+    # Votre modèle 'model_ebm' doit avoir une méthode .predict_proba(dataframe).
+    # Exemple:
+    # df_data = pd.read_csv('votre_fichier.csv')
+    # from sklearn.ensemble import RandomForestClassifier
+    # model_ebm = RandomForestClassifier.load('votre_modele.joblib')
+
+    df_data = None  # REMPLACEZ 'None' par votre DataFrame chargé
+    model_ebm = None # REMPLACEZ 'None' par votre modèle chargé
+
+    # !!! NE PAS MODIFIER LA SECTION SUIVANTE (SIMULATEUR) SI VOUS UTILISEZ VOS PROPRES DONNÉES ET MODÈLE !!!
+    # --- SIMULATEUR (À COMMENTER/SUPPRIMER SI VOUS CHARGEZ VOS VRAIS OBJETS) ---
+    if df_data is None or model_ebm is None:
+        print("\nATTENTION: Utilisation de données et d'un modèle fictifs. Pour utiliser vos propres données, veuillez modifier la section ci-dessus.")
+
+        # Modèle EBM Fictif
+        class MockEBMModel:
+            def predict_proba(self, x_features_df):
+                prob_base = 0.95
+                prime_feature_val = x_features_df[MODEL_PRIME_FEATURE].fillna(0)
+                std_dev = prime_feature_val.std()
+                safe_std_dev = np.maximum(std_dev, 1) if isinstance(std_dev, (int, float)) else prime_feature_val.apply(lambda x: np.maximum(x, 1))
+                reduction_prime = (prime_feature_val - prime_feature_val.mean()) / safe_std_dev
+                prob_conversion = (prob_base - reduction_prime * 0.01).clip(0.01, 0.99)
+                return np.vstack([1 - prob_conversion, prob_conversion]).T
+
+        # Données Fictives
+        def create_test_data(n_contrats=10000):
+            print(f"Création de {n_contrats} contrats fictifs...")
+            list_activites = [
+                'auto', 'habitation', 'sante', 'entreprise', 'agricole',
+                'commerce', 'artisanat', 'tourisme', 'transport', 'services'
+            ]
+            data = []
+            elr_map = {
+                'auto': 0.75, 'habitation': 0.35, 'sante': 0.38, 'entreprise': 0.95,
+                'agricole': 0.60, 'commerce': 0.55, 'artisanat': 0.70,
+                'tourisme': 0.45, 'transport': 0.85, 'services': 0.50
+            }
+            for i in range(n_contrats):
+                act = random.choice(list_activites)
+                prime_comm = random.uniform(200, 3000)
+                prime_pur = prime_comm * elr_map[act] * random.uniform(0.8, 1.2)
+
+                data.append({
+                    'numcnt': f"c{1000+i}",
+                    'prime_pure': prime_pur,
+                    'prime_commercialle': prime_comm,
+                    'code activite': act,
+                    'surface_bins': random.choice(['small_surface', 'medium_surface', 'large_surface']),
+                    'chiffre_affaires_bins': random.choice(['low_ca', 'medium_ca', 'high_ca']),
+                    'capital_incendie_bins': random.choice(['low_cap', 'medium_cap', 'high_cap']),
+                    'type_client': random.choice(['particulier', 'professionnel']),
+                    'type_occupation_local': random.choice(['locataire', 'proprietaire']),
+                    'reduction': random.choice([True, False])
+                })
+            return pd.DataFrame(data)
+
+        model_ebm = MockEBMModel()
+        df_data = create_test_data()
+    # --- FIN DU SIMULATEUR ---
+
+    # ------------------------------------------------------------------
+    # --- 2. PRÉPARATION ---
+    # ------------------------------------------------------------------
+
+    # Standardisation des noms de colonnes
+    df_data.columns = [col.lower().strip() for col in df_data.columns]
+
+    # Rename columns to match MODEL_FEATURES_BASE and MODEL_PRIME_FEATURE expectations
+    df_data.rename(columns={
+        'code activite': 'activite_reduite',
+        'prime_commercialle': MODEL_PRIME_FEATURE # Renames to 'COPTTC'
+    }, inplace=True)
+
+    # Validation des colonnes requises
+    required_cols = MODEL_FEATURES_BASE + [MODEL_PRIME_FEATURE, 'numcnt', 'prime_pure', 'activite_reduite']
     missing_cols = [col for col in required_cols if col not in df_data.columns]
     if missing_cols:
-        print(f"erreur: colonnes manquantes dans vos données : {missing_cols}")
-        return none
+        print(f"\nERREUR: Colonnes manquantes dans vos données : {missing_cols}")
+        return
 
-    list_activites = df_data['activite'].unique().tolist()
-    k_activites = len(list_activites)
-    print(f"-> {len(df_data)} contrats et {k_activites} activités trouvés.")
+    LISTE_ACTIVITES = df_data['activite_reduite'].unique().tolist()
+    K_ACTIVITES = len(LISTE_ACTIVITES)
+    print(f"\nDonnées chargées : {len(df_data)} contrats, {K_ACTIVITES} activités.")
 
-    # 2. préparation (calcul elr, domaines...)
-    domaines_map, activite_index_map, s_vp, s_autre, df_primes_activite = get_domaines_par_activite(df_data, list_activites)
-    
-    if domaines_map is none:
-        print("erreur lors de la préparation des domaines. arrêt.")
-        return none
+    domaines_map, activite_index_map, s_vp, s_autre, df_primes_activite = get_domaines_par_activite(df_data, LISTE_ACTIVITES)
 
-    # 3. configuration deap
-    toolbox = setup_deap(domaines_map, activite_index_map, df_data, s_autre, df_primes_activite, 
-                         model_ebm, model_features, list_activites)
-    
-    # 4. exécution de l'optimisation
-    best_solution = run_optimization(toolbox)
-    
-    # 5. analyse et retour des résultats
-    optimal_majorations = analyze_results(best_solution, df_data, activite_index_map, s_vp, s_autre, 
-                                          df_primes_activite, model_ebm, model_features, list_activites)
-    
-    return optimal_majorations
+    if domaines_map is None:
+        print("Arrêt du script (erreur de préparation).")
+        return
 
-# ----------------------------------------------------------------------
-# 7. point d'entrée (exemple de test)
-# ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # --- 3. CONFIGURATION DEAP ---
+    # ------------------------------------------------------------------
 
+    toolbox = base.Toolbox()
+    toolbox = setup_deap(toolbox, K_ACTIVITES, LISTE_ACTIVITES, domaines_map)
+
+    # Enregistrement de la fonction d'évaluation avec tous ses arguments "fixes"
+    # C'est l'étape clé qui connecte DEAP à nos données
+    toolbox.register("evaluate", evaluate_solution,
+                     df_data=df_data,
+                     model_ebm=model_ebm,
+                     activite_index_map=activite_index_map,
+                     list_activites=LISTE_ACTIVITES,
+                     s_autre=s_autre,
+                     df_primes_activite=df_primes_activite)
+
+    # ------------------------------------------------------------------
+    # --- 4. EXÉCUTION & ANALYSE ---
+    # ------------------------------------------------------------------
+
+    best_solution = run_optimization(toolbox, K_ACTIVITES)
+
+    optimal_majorations = analyze_results(best_solution, df_data, model_ebm,
+                                          activite_index_map, LISTE_ACTIVITES,
+                                          s_vp, s_autre, df_primes_activite)
+
+    print("\n--- PROCESSUS TERMINÉ ---")
+    if optimal_majorations:
+        print("Majorations optimales trouvées :", optimal_majorations)
+
+# Point d'entrée du script
 if __name__ == "__main__":
-    
-    print("--- DÉBUT DU SCRIPT DE TEST ---")
-    print("ATTENTION: ce script s'exécute avec un modèle et des données fictifs.")
-    print("Modifiez la section 'if __name__ == \"__main__\":' pour utiliser vos vraies données.\n")
-
-    # --- 1. CRÉATION D'UN MODÈLE EBM FICTIF (POUR LE TEST) ---
-    # ce modèle simule l'interface .predict_proba() de scikit-learn
-    class mockebmmodel:
-        def __init__(self):
-            # le modèle doit connaître l'ordre des features
-            self.features_ = ['activite', 'surface', 'ca', 'local', 'type_client', 
-                              'reduction', 'capital_incendie', 'prime_ajuset']
-            print("modèle ebm fictif initialisé.")
-
-        def predict_proba(self, x_features):
-            # x_features est un dataframe pandas
-            
-            # simule une logique d'élasticité simple
-            # la probabilité de base est haute
-            prob_base = 0.95 
-            
-            # la 'prime_ajuset' réduit la probabilité
-            # on normalise la prime pour avoir un effet raisonnable
-            reduction_prime = (x_features['prime_ajuset'] - 500) / 5000
-            
-            # le 'ca' (chiffre d'affaires) rend le client moins sensible
-            # (supposons ca = 0 pour particulier, > 0 pour pro)
-            reduction_ca = -x_features['ca'] / 100000 
-            
-            prob_conversion = prob_base - reduction_prime + reduction_ca
-            prob_conversion = prob_conversion.clip(0.01, 0.99)
-            
-            # retourne [prob_non_conversion, prob_conversion]
-            return np.vstack([1 - prob_conversion, prob_conversion]).t
-
-    # --- 2. CRÉATION DE DONNÉES FICTIVES (POUR LE TEST) ---
-    def create_test_data(n_contrats=2000):
-        print(f"création de {n_contrats} contrats fictifs...")
-        list_activites = ['auto', 'habitation', 'sante', 'entreprise', 'agricole']
-        data = []
-        
-        elr_moyen_activite = {
-            'auto': 0.75, 'habitation': 0.35, 'sante': 0.38, 
-            'entreprise': 0.95, 'agricole': 0.60
-        }
-        
-        for i in range(n_contrats):
-            act = random.choice(list_activites)
-            prime_comm = random.uniform(200, 3000)
-            elr_moyen = elr_moyen_activite[act]
-            prime_pur = prime_comm * elr_moyen * random.uniform(0.8, 1.2)
-            
-            data.append({
-                'numcnt': f"c{1000+i}",
-                'prime pure': prime_pur,
-                'prime commerciale': prime_comm,
-                'activite': act,
-                'surface': random.uniform(50, 500),
-                'ca': random.choice([0, 0, 0, 50000, 100000]), # chiffre d'affaires
-                'local': random.choice(['urbain', 'rural']),
-                'type_client': random.choice(['particulier', 'pro']),
-                'reduction': random.choice([0, 0.1, 0.2]),
-                'capital_incendie': random.uniform(10000, 500000)
-            })
-        return pd.dataframe(data)
-
-    # --- 3. CHARGEMENT ET EXÉCUTION (À MODIFIER) ---
-    
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    # !!! MODIFIEZ LES DEUX LIGNES SUIVANTES POUR VOS DONNÉES RÉELLES !!!
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    
-    # exemple fictif :
-    mon_modele_ebm = mockebmmodel()
-    mes_donnees = create_test_data(n_contrats=5000) # (devrait être 5000+ pour être réaliste)
-
-    # exemple réel (à décommenter) :
-    # print("chargement du modèle ebm réel...")
-    # mon_modele_ebm = joblib.load('chemin/vers/votre/model_ebm.pkl')
-    # print("chargement des données réelles...")
-    # mes_donnees = pd.read_parquet('chemin/vers/vos/donnees.parquet')
-    # mes_donnees.columns = [col.lower().strip() for col in mes_donnees.columns] # nettoyage
-    
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    
-    
-    if mon_modele_ebm is not none and not mes_donnees.empty:
-        # 4. lancement de l'orchestrateur principal
-        majorations_finales = main_optimization(df_data=mes_donnees, 
-                                                model_ebm=mon_modele_ebm)
-        
-        print("\n--- optimisation terminée ---")
-        print("majorations finales suggérées :", majorations_finales)
-    else:
-        print("erreur: 'mon_modele_ebm' ou 'mes_donnees' n'ont pas été chargés.")
-        print("veuillez modifier la section 'if __name__ == \"__main__\":' du script.")
+    main()
