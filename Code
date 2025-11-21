@@ -1,23 +1,29 @@
-# AJOUTEZ CE BLOC :
-    if best_solution:
-        # Appeler le nouveau plot de convergence
-        plot_convergence_history(logbook)
-        
-        # Appeler votre fonction d'analyse (qui contient maintenant les 3 autres plots)
-        optimal_majorations = analyze_results(best_solution, df_data, model_ebm,
-                                              activite_index_map, LISTE_ACTIVITES,
-                                              s_vp, s_autre, df_primes_activite)
+from sklearn.linear_model import LogisticRegression
+from interpret.glassbox import ExplainableBoostingClassifier
+import numpy as np
 
-        print("\n--- PROCESSUS TERMINÉ ---")
-        if optimal_majorations:
-            print("Majorations optimales trouvées :", optimal_majorations)
-            
-        # AJOUTEZ CETTE LIGNE pour afficher les fenêtres de graphiques
-        print("\nAffichage des graphiques...")
-        plt.show()
-    else:
-        print("\n--- PROCESSUS ÉCHOUÉ (Pas de solution trouvée) ---")
+# --- ÉTAPE 1 : Le Chef (GLM sur le Prix uniquement) ---
+# On utilise le prix (et peut-être le prix au carré pour une courbe)
+X_prix = df[['prix']] 
 
-# Point d'entrée du script
-if __name__ == "__main__":
-    main()
+glm = LogisticRegression(penalty=None) # Pas de régularisation pour laisser le prix jouer à fond
+glm.fit(X_prix, y_train)
+
+# On récupère le "Log-Odds" (le score brut, pas la probabilité %)
+# C'est crucial : on veut le raw score pour l'init_score
+glm_offset = glm.decision_function(X_prix)
+
+
+# --- ÉTAPE 2 : L'Expert (EBM sur le reste) ---
+# On prend toutes les variables SAUF le prix
+X_profil = df[['capital_incendie', 'type_occupation', 'zone', ...]]
+
+ebm = ExplainableBoostingClassifier()
+
+# C'EST ICI LA MAGIE : on passe l'offset du GLM dans init_score
+ebm.fit(X_profil, y_train, init_score=glm_offset)
+
+# --- ÉTAPE 3 : Prédiction Finale ---
+# Pour prédire, il faut sommer les deux :
+# Score Final = Score(GLM Prix) + Score(EBM Profil)
+# (La librairie gère souvent ça, mais conceptuellement c'est l'addition des deux)
