@@ -1,29 +1,97 @@
-from sklearn.linear_model import LogisticRegression
-from interpret.glassbox import ExplainableBoostingClassifier
+import pandas as pd
 import numpy as np
+from interpret.glassbox import ExplainableBoostingRegressor, ExplainableBoostingClassifier
 
-# --- ÉTAPE 1 : Le Chef (GLM sur le Prix uniquement) ---
-# On utilise le prix (et peut-être le prix au carré pour une courbe)
-X_prix = df[['prix']] 
+# 1. Définition des variables
+# On sépare la cible (y), le traitement (prix) et les confondeurs (le profil)
+col_target = 'Conversion'  # Ta variable 0/1 (à adapter si elle a un autre nom)
+col_prix = 'Cop_ttc'
 
-glm = LogisticRegression(penalty=None) # Pas de régularisation pour laisser le prix jouer à fond
-glm.fit(X_prix, y_train)
+cols_confounders = [
+    'Activité', 
+    'Produit', 
+    'Type_occupation_local', 
+    'Type_client', 
+    'Reduction', 
+    'Chiffres_affaires_bins', 
+    'Surface', 
+    'Capital_incendie'
+]
 
-# On récupère le "Log-Odds" (le score brut, pas la probabilité %)
-# C'est crucial : on veut le raw score pour l'init_score
-glm_offset = glm.decision_function(X_prix)
+# Supposons que ton DataFrame s'appelle df
+# df = pd.read_csv('tes_donnees.csv')
 
+# ---------------------------------------------------------
+# ÉTAPE 1 : Modèle de Prix (Désbiaisage)
+# On apprend quel est le prix "normal" pour chaque profil
+# ---------------------------------------------------------
+print("Entraînement du modèle de prix de référence...")
+ebm_prix = ExplainableBoostingRegressor(
+    feature_names=cols_confounders
+)
+ebm_prix.fit(df[cols_confounders], df[col_prix])
 
-# --- ÉTAPE 2 : L'Expert (EBM sur le reste) ---
-# On prend toutes les variables SAUF le prix
-X_profil = df[['capital_incendie', 'type_occupation', 'zone', ...]]
+# On prédit le prix "technique" ou "attendu"
+prix_attendu = ebm_prix.predict(df[cols_confounders])
 
-ebm = ExplainableBoostingClassifier()
+# ---------------------------------------------------------
+# ÉTAPE 2 : Création de la variable "Prix Relatif" (Orthogonalisation)
+# Si > 1 : Le client paie plus cher que son profil type (Cher)
+# Si < 1 : Le client paie moins cher (Bonne affaire)
+# ---------------------------------------------------------
+# On ajoute une petite epsilon pour éviter la division par zéro si le prix attendu est 0
+df['price_relative'] = df[col_prix] / (prix_attendu + 0.001)
 
-# C'EST ICI LA MAGIE : on passe l'offset du GLM dans init_score
-ebm.fit(X_profil, y_train, init_score=glm_offset)
+print("Moyenne du prix relatif (doit être proche de 1) :", df['price_relative'].mean())
 
-# --- ÉTAPE 3 : Prédiction Finale ---
-# Pour prédire, il faut sommer les deux :
-# Score Final = Score(GLM Prix) + Score(EBM Profil)
-# (La librairie gère souvent ça, mais conceptuellement c'est l'addition des deux)
+# ---------------------------------------------------------
+# ÉTAPE 3 : Modèle Final de Conversion
+# On utilise le profil (pour la performance) + le Prix Relatif (pour l'élasticité)
+# IMPORTANT : On ne met PAS 'Cop_ttc' ici, mais 'price_relative'
+# ---------------------------------------------------------
+cols_finales = cols_confounders + ['price_relative']
+
+print("Entraînement du modèle final de conversion...")
+ebm_final = ExplainableBoostingClassifier(
+    feature_names=cols_finales,
+    # On force la monotonicité sur le prix relatif : plus c'est cher (relatif), moins on convertit
+    monotonicity={'price_relative': -1} 
+)
+
+ebm_final.fit(df[cols_finales], df[col_target])
+
+print("Modèle terminé !")
+
+# ---------------------------------------------------------
+# TEST DE SIMULATION (Ce que tu cherches)
+# Fonction pour voir l'évolution de la probabilité quand on varie le prix
+# ---------------------------------------------------------
+def simuler_elasticite(client_index, variations_prix):
+    """
+    Prend un client existant et teste différents prix pour voir la proba.
+    """
+    # On récupère les données du client
+    client_data = df.iloc[[client_index]].copy()
+    
+    # Le prix attendu de ce client (fixe, car son profil Capital/Surface ne change pas)
+    reference_price = ebm_prix.predict(client_data[cols_confounders])[0]
+    
+    results = []
+    
+    for nouveau_prix in variations_prix:
+        # 1. On met à jour le prix relatif correspondant à ce nouveau prix
+        nouvel_indice = nouveau_prix / reference_price
+        client_data['price_relative'] = nouvel_indice
+        
+        # 2. On prédit la probabilité
+        proba = ebm_final.predict_proba(client_data[cols_finales])[0, 1]
+        results.append({'Prix': nouveau_prix, 'Prix_Relatif': nouvel_indice, 'Proba_Conversion': proba})
+    
+    return pd.DataFrame(results)
+
+# Exemple d'utilisation : On prend le client n°10 et on teste des prix de 100 à 500
+test_prix = np.linspace(100, 500, 20)
+resultats = simuler_elasticite(client_index=10, variations_prix=test_prix)
+
+print("\nSimulation pour le client 10 :")
+print(resultats)
