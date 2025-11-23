@@ -1,0 +1,106 @@
+Voici le second mémo technique, structuré pour être le complément direct du premier. Il met l'accent sur la logique mathématique et l'implémentation de la stratégie tarifaire.
+
+---
+
+# 📄 Mémo Technique : Modélisation des Majorations (Approche Double Sigmoïde)
+
+**Objet :** Construction d'une matrice de majoration lissée basée sur le risque (ELR) et la conversion (TC).
+**Destinataire :** Équipe Actuariat / Data Science.
+**Outil de simulation :** Streamlit (recommandé pour la calibration).
+
+---
+
+## 1. Objectif et Philosophie
+
+L'objectif est de définir une **matrice de majoration tarifaire** pour chaque produit. Contrairement à une approche par règles discrètes (seuils durs) qui crée des effets de seuil brutaux, nous utilisons une **approche continue et lissée**.
+
+**Les avantages de cette méthode :**
+* **Interprétabilité :** Les paramètres contrôlent la forme globale de la courbe.
+* **Cohérence :** Assure une transition fluide des majorations entre les segments proches.
+* **Double dimension :** Prend en compte simultanément la rentabilité (ELR) et la capacité de conversion (Taux de Concrétisation).
+
+---
+
+## 2. Préparation des Données et Segmentation
+
+Avant d'appliquer le modèle, les données (activités par produit) sont segmentées en une grille $(i, j)$.
+
+### 2.1. Variables d'entrée
+Pour chaque activité d'un produit donné, nous récupérons :
+* **ELR (Earned Loss Ratio) :** Indicateur de rentabilité (S/P).
+* **TC (Taux de Concrétisation) :** Indicateur de performance commerciale.
+
+### 2.2. Discrétisation (Binning)
+Nous transformons les variables continues en indices de segments (quantiles) triés de façon croissante.
+
+| Dimension | Variable | Nombre de Segments (Quantiles) | Indice correspondant |
+| :--- | :--- | :--- | :--- |
+| **Risque** | ELR | **20 bins** (Plus granulaire car prioritaire) | $i \in [0, 19]$ |
+| **Conversion** | Taux de Concrétisation | **10 bins** | $j \in [0, 9]$ |
+
+> **Note :** Le tri est croissant. Un indice $i$ élevé correspond à un ELR élevé (mauvais risque). Un indice $j$ élevé correspond à un TC élevé (forte conversion).
+
+---
+
+## 3. Le Modèle Mathématique (Double Sigmoïde)
+
+Le coefficient de majoration pour un segment donné $(i, j)$ est calculé par le produit de deux fonctions sigmoïdes et d'un plafond global.
+
+### 3.1. Formule Générale
+
+$$Maj_{i,j} = M_{max} \times \sigma(\text{Terme ELR}) \times \sigma(\text{Terme TC})$$
+
+Soit en détail :
+
+$$Maj_{i,j} = M_{max} \times \left( \frac{1}{1 + e^{-\alpha (i - c_i)}} \right) \times \left( \frac{1}{1 + e^{-\beta (j - c_j)}} \right)$$
+
+### 3.2. Définition des Paramètres
+
+* **$Maj_{i,j}$** : Le coefficient de majoration final appliqué au segment.
+* **$M_{max}$** : La **majoration maximale** autorisée (borne supérieure). La sigmoïde sature vers cette valeur pour les segments les plus dégradés.
+* **$i, j$** : Les indices des segments (bins) pour l'ELR et le TC.
+* **$c_i, c_j$ (Centres/Offsets)** :
+    * Ce sont des constantes qui définissent le **point d'inflexion** de la courbe.
+    * C'est le segment à partir duquel la majoration commence à s'accélérer significativement (le "milieu" de la sigmoïde).
+* **$\alpha, \beta$ (Pentes/Raideurs)** :
+    * Contrôlent la **vitesse d'accélération** de la majoration entre un segment et le suivant.
+    * Une valeur élevée rend la transition brutale (proche d'un escalier). Une valeur faible rend la transition très progressive.
+
+### 3.3. Logique Métier dans les Paramètres
+* **Contrainte $\alpha > \beta$ :**
+    * Nous voulons pénaliser le risque (ELR) plus fortement que le taux de conversion.
+    * Par conséquent, la pente $\alpha$ (liée à l'ELR) doit être supérieure à $\beta$.
+
+---
+
+## 4. Stratégie d'Optimisation
+
+L'objectif n'est pas de définir manuellement chaque coefficient, mais d'atteindre une cible macro-économique.
+
+### 4.1. Le processus
+1.  **Fixer les invariants :** Définir $M_{max}$ (le plafond) et les centres $c_i, c_j$ (points de bascule souhaités) selon la connaissance métier.
+2.  **Définir la cible :** Fixer une **Majoration Moyenne Cible** pour le produit (ex: +5% global sur le portefeuille).
+3.  **Optimisation :**
+    * On cherche le couple $(\alpha, \beta)$ optimal.
+    * L'algorithme fait varier $\alpha$ et $\beta$ pour minimiser l'écart entre la majoration moyenne résultante et la majoration cible.
+
+$$Min_{\alpha, \beta} \left| \left( \sum_{k=1}^{N} Maj_{k}(\alpha, \beta) \times Poids_k \right) - \text{Cible} \right|$$
+
+*(Où $k$ représente une activité et $Poids_k$ son importance dans le portefeuille).*
+
+---
+
+## 5. Outillage et Visualisation (Streamlit)
+
+La nature non-linéaire des sigmoïdes rend l'ajustement des paramètres $\alpha$ et $\beta$ difficile à imaginer mentalement.
+
+**Recommandation forte :** Utiliser l'application **Streamlit** développée pour ce projet.
+* Elle permet de modifier les curseurs ($\alpha, \beta, c_i, c_j$) en temps réel.
+* Elle permet de visualiser la "Surface de Majoration" (Heatmap 2D) pour vérifier que la transition est lisse et cohérente.
+* Elle calcule instantanément l'impact moyen sur le portefeuille pour valider l'atteinte de la cible.
+
+---
+
+### Prochaine étape immédiate pour vous
+
+Voulez-vous que je rédige un **squelette de code Python** (fonction ou classe) qui implémente cette formule de double sigmoïde et la fonction d'optimisation simple pour trouver alpha/beta ?
