@@ -1,97 +1,204 @@
 import pandas as pd
 import numpy as np
-from interpret.glassbox import ExplainableBoostingRegressor, ExplainableBoostingClassifier
+from ortools.linear_solver import pywraplp
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# 1. Définition des variables
-# On sépare la cible (y), le traitement (prix) et les confondeurs (le profil)
-col_target = 'Conversion'  # Ta variable 0/1 (à adapter si elle a un autre nom)
-col_prix = 'Cop_ttc'
+# Configuration pour des graphiques propres
+sns.set_theme(style="whitegrid")
+plt.rcParams['figure.figsize'] = [12, 8]
 
-cols_confounders = [
-    'Activité', 
-    'Produit', 
-    'Type_occupation_local', 
-    'Type_client', 
-    'Reduction', 
-    'Chiffres_affaires_bins', 
-    'Surface', 
-    'Capital_incendie'
-]
+# ==============================================================================
+# BLOC 1 : GÉNÉRATION DE DONNÉES (Simulation de ton environnement)
+# ==============================================================================
+print("--- 1. GÉNÉRATION DES DONNÉES ---")
 
-# Supposons que ton DataFrame s'appelle df
-# df = pd.read_csv('tes_donnees.csv')
+np.random.seed(42)
+n_devis = 500
 
-# ---------------------------------------------------------
-# ÉTAPE 1 : Modèle de Prix (Désbiaisage)
-# On apprend quel est le prix "normal" pour chaque profil
-# ---------------------------------------------------------
-print("Entraînement du modèle de prix de référence...")
-ebm_prix = ExplainableBoostingRegressor(
-    feature_names=cols_confounders
-)
-ebm_prix.fit(df[cols_confounders], df[col_prix])
+# A. BASE PORTEFEUILLE (Historique pour caler les ELR)
+activites = ['Boulangerie', 'BTP', 'Consulting', 'Transport', 'Coiffure']
+# On simule que le BTP et Transport sont risqués (sinistres élevés)
+data_pf = []
+for act in activites:
+    risk_factor = 1.5 if act in ['BTP', 'Transport'] else 0.4
+    for _ in range(200): # 200 contrats par activité
+        prime = np.random.uniform(800, 3000)
+        # Charge sinistre aléatoire (Lognormale pour simuler la queue de distribution)
+        charge = np.random.lognormal(mean=np.log(prime * risk_factor), sigma=1.0)
+        data_pf.append({'activite': act, 'prime_acquise': prime, 'charge_sinistre': charge})
 
-# On prédit le prix "technique" ou "attendu"
-prix_attendu = ebm_prix.predict(df[cols_confounders])
+df_portefeuille = pd.DataFrame(data_pf)
 
-# ---------------------------------------------------------
-# ÉTAPE 2 : Création de la variable "Prix Relatif" (Orthogonalisation)
-# Si > 1 : Le client paie plus cher que son profil type (Cher)
-# Si < 1 : Le client paie moins cher (Bonne affaire)
-# ---------------------------------------------------------
-# On ajoute une petite epsilon pour éviter la division par zéro si le prix attendu est 0
-df['price_relative'] = df[col_prix] / (prix_attendu + 0.001)
+# B. BASE DEVIS (Les nouvelles affaires à tarifer)
+data_devis = {
+    'id': range(n_devis),
+    'activite': np.random.choice(activites, n_devis),
+    'prime_initiale': np.random.uniform(800, 3000, n_devis),
+    'proba_initiale': np.random.uniform(0.20, 0.40, n_devis) # Score EBM
+}
+df_devis = pd.DataFrame(data_devis)
 
-print("Moyenne du prix relatif (doit être proche de 1) :", df['price_relative'].mean())
+print(f"Portefeuille : {len(df_portefeuille)} lignes | Devis à traiter : {len(df_devis)}")
 
-# ---------------------------------------------------------
-# ÉTAPE 3 : Modèle Final de Conversion
-# On utilise le profil (pour la performance) + le Prix Relatif (pour l'élasticité)
-# IMPORTANT : On ne met PAS 'Cop_ttc' ici, mais 'price_relative'
-# ---------------------------------------------------------
-cols_finales = cols_confounders + ['price_relative']
 
-print("Entraînement du modèle final de conversion...")
-ebm_final = ExplainableBoostingClassifier(
-    feature_names=cols_finales,
-    # On force la monotonicité sur le prix relatif : plus c'est cher (relatif), moins on convertit
-    monotonicity={'price_relative': -1} 
-)
+# ==============================================================================
+# BLOC 2 : MOTEUR ACTUARIEL (Calcul des coûts et bornes)
+# ==============================================================================
+print("\n--- 2. CALCULS ACTUARIELS ---")
 
-ebm_final.fit(df[cols_finales], df[col_target])
+# 1. Calcul des ELR par activité sur le portefeuille
+elr_table = df_portefeuille.groupby('activite')[['prime_acquise', 'charge_sinistre']].sum().reset_index()
+elr_table['elr_ref'] = elr_table['charge_sinistre'] / elr_table['prime_acquise']
 
-print("Modèle terminé !")
+# 2. Projection sur les devis
+df_model = df_devis.merge(elr_table[['activite', 'elr_ref']], on='activite', how='left')
 
-# ---------------------------------------------------------
-# TEST DE SIMULATION (Ce que tu cherches)
-# Fonction pour voir l'évolution de la probabilité quand on varie le prix
-# ---------------------------------------------------------
-def simuler_elasticite(client_index, variations_prix):
-    """
-    Prend un client existant et teste différents prix pour voir la proba.
-    """
-    # On récupère les données du client
-    client_data = df.iloc[[client_index]].copy()
+# 3. Calcul du COÛT TECHNIQUE (La constante cruciale)
+# C'est ce que le client coûte en moyenne, peu importe le prix de vente
+df_model['cout_technique'] = df_model['prime_initiale'] * df_model['elr_ref']
+
+# 4. Définition des Bornes de majoration (Règles Métier)
+def get_bounds(elr):
+    if elr < 0.40: return 0.00, 0.02   # Bons risques : Hausse faible (0-2%)
+    elif elr < 0.80: return 0.02, 0.05 # Risques moyens : Hausse standard (2-5%)
+    else: return 0.05, 0.15            # Mauvais risques : Assainissement (5-15%)
+
+bounds = df_model['elr_ref'].apply(get_bounds)
+df_model['min_h'] = [b[0] for b in bounds]
+df_model['max_h'] = [b[1] for b in bounds]
+
+print(df_model[['id', 'activite', 'prime_initiale', 'elr_ref', 'min_h', 'max_h']].head())
+
+
+# ==============================================================================
+# BLOC 3 : PRÉPARATION & OPTIMISATION (OR-TOOLS)
+# ==============================================================================
+print("\n--- 3. OPTIMISATION (MAXIMISATION MARGE) ---")
+
+# A. Génération des Scénarios Discrets
+def predict_elasticity(proba_base, hausse):
+    # Simulation: -1.2 d'élasticité (Pour 10% de hausse, la proba baisse de 12% relatifs)
+    impact = 1 - (1.2 * hausse)
+    return max(0, proba_base * impact)
+
+scenarios = []
+for idx, row in df_model.iterrows():
+    # On crée 5 points de test entre min et max
+    steps = np.linspace(row['min_h'], row['max_h'], 5)
+    steps = np.unique(steps) # Évite doublons si min=max
     
-    # Le prix attendu de ce client (fixe, car son profil Capital/Surface ne change pas)
-    reference_price = ebm_prix.predict(client_data[cols_confounders])[0]
-    
-    results = []
-    
-    for nouveau_prix in variations_prix:
-        # 1. On met à jour le prix relatif correspondant à ce nouveau prix
-        nouvel_indice = nouveau_prix / reference_price
-        client_data['price_relative'] = nouvel_indice
+    for hausse in steps:
+        prime_new = row['prime_initiale'] * (1 + hausse)
+        proba_new = predict_elasticity(row['proba_initiale'], hausse)
         
-        # 2. On prédit la probabilité
-        proba = ebm_final.predict_proba(client_data[cols_finales])[0, 1]
-        results.append({'Prix': nouveau_prix, 'Prix_Relatif': nouvel_indice, 'Proba_Conversion': proba})
+        # --- CŒUR DU SYSTÈME : La Marge Espérée ---
+        # (Prix Vendu - Coût Fixe) * Probabilité
+        marge_esp = (prime_new - row['cout_technique']) * proba_new
+        
+        scenarios.append({
+            'id': row['id'],
+            'prime_base': row['prime_initiale'],
+            'activite': row['activite'],
+            'elr': row['elr_ref'],
+            'hausse': hausse,
+            'proba_new': proba_new,
+            'prime_new': prime_new,
+            'marge_esperee': marge_esp
+        })
+
+df_scen = pd.DataFrame(scenarios)
+
+# B. Solveur
+solver = pywraplp.Solver.CreateSolver('SCIP')
+if not solver: raise Exception("Solveur introuvable")
+
+x = {} # Variables binaires
+for i in df_scen.index:
+    x[i] = solver.BoolVar(f'x_{i}')
+
+# Contrainte 1 : Unicité (1 prix par devis)
+for d_id, group in df_scen.groupby('id'):
+    solver.Add(solver.Sum([x[i] for i in group.index]) == 1)
+
+# Contrainte 2 : Rétention Volume (> 90% du volume contrats initial)
+vol_init = df_model['proba_initiale'].sum()
+solver.Add(solver.Sum([df_scen.loc[i, 'proba_new'] * x[i] for i in df_scen.index]) >= 0.90 * vol_init)
+
+# Contrainte 3 : Majoration Moyenne (Entre 3.8% et 4.5% pondéré Prime)
+sum_primes = df_model['prime_initiale'].sum()
+weighted_sum = solver.Sum([df_scen.loc[i, 'prime_base'] * df_scen.loc[i, 'hausse'] * x[i] for i in df_scen.index])
+solver.Add(weighted_sum >= 0.038 * sum_primes)
+solver.Add(weighted_sum <= 0.045 * sum_primes)
+
+# OBJECTIF : Max Marge
+solver.Maximize(solver.Sum([df_scen.loc[i, 'marge_esperee'] * x[i] for i in df_scen.index]))
+
+status = solver.Solve()
+
+# ==============================================================================
+# BLOC 4 : ANALYSE ET VISUALISATION
+# ==============================================================================
+if status == pywraplp.Solver.OPTIMAL:
+    print(">>> SOLUTION OPTIMALE TROUVÉE !\n")
     
-    return pd.DataFrame(results)
+    # Récupération des résultats
+    selected_indices = [i for i in x if x[i].solution_value() > 0.5]
+    res = df_scen.loc[selected_indices].copy()
+    
+    # KPIs
+    avg_increase = (res['prime_base'] * res['hausse']).sum() / res['prime_base'].sum()
+    retention_rate = res['proba_new'].sum() / vol_init
+    total_margin = res['marge_esperee'].sum()
+    
+    # Marge Initiale (pour comparer)
+    # Marge si on ne faisait rien (Hausse 0)
+    # On simule grossièrement la marge initiale avec les probas initiales
+    margin_init = ((df_model['prime_initiale'] - df_model['cout_technique']) * df_model['proba_initiale']).sum()
+    
+    print(f"KPIs GLOBAUX :")
+    print(f"- Majoration Moyenne : {avg_increase:.2%}")
+    print(f"- Rétention Volume   : {retention_rate:.1%}")
+    print(f"- Gain de Marge      : +{(total_margin - margin_init):,.0f} € (vs scénario plat)")
 
-# Exemple d'utilisation : On prend le client n°10 et on teste des prix de 100 à 500
-test_prix = np.linspace(100, 500, 20)
-resultats = simuler_elasticite(client_index=10, variations_prix=test_prix)
+    # --- VISUALISATION ---
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    plt.subplots_adjust(hspace=0.3)
 
-print("\nSimulation pour le client 10 :")
-print(resultats)
+    # Graphique 1 : Distribution des hausses
+    sns.histplot(data=res, x='hausse', bins=15, kde=True, color='skyblue', ax=axes[0, 0])
+    axes[0, 0].set_title('Distribution des Majorations Appliquées')
+    axes[0, 0].set_xlabel('Taux de hausse')
+    axes[0, 0].axvline(avg_increase, color='red', linestyle='--', label=f'Moyenne: {avg_increase:.1%}')
+    axes[0, 0].legend()
+
+    # Graphique 2 : Stratégie par Activité (Boxplot)
+    # Montre que les activités pourries (ELR haut) prennent cher
+    sns.boxplot(data=res, x='activite', y='hausse', palette="Set2", ax=axes[0, 1])
+    axes[0, 1].set_title('Stratégie Tarifaire par Activité')
+    axes[0, 1].set_ylabel('Hausse appliquée')
+
+    # Graphique 3 : Cohérence ELR vs Hausse (Scatter)
+    # On veut voir une corrélation positive : Plus l'ELR est haut, plus la hausse est haute
+    sns.scatterplot(data=res, x='elr', y='hausse', hue='activite', size='prime_base', sizes=(20, 200), ax=axes[1, 0])
+    axes[1, 0].set_title('Corrélation : Qualité du Risque (ELR) vs Hausse')
+    axes[1, 0].set_xlabel('ELR (Expected Loss Ratio)')
+    axes[1, 0].set_ylabel('Hausse appliquée')
+    # Zone d'assainissement
+    axes[1, 0].axvspan(1.0, res['elr'].max(), color='red', alpha=0.1, label='Zone Déficitaire')
+
+    # Graphique 4 : Impact Volume vs Marge (Barplot)
+    # On compare la répartition du volume avant/après (somme des probas)
+    vol_per_act_before = df_model.groupby('activite')['proba_initiale'].sum()
+    vol_per_act_after = res.groupby('activite')['proba_new'].sum()
+    
+    comp_df = pd.DataFrame({'Avant': vol_per_act_before, 'Après': vol_per_act_after}).reset_index()
+    comp_df = comp_df.melt(id_vars='activite', var_name='Scenario', value_name='Volume Attendu')
+    
+    sns.barplot(data=comp_df, x='activite', y='Volume Attendu', hue='Scenario', ax=axes[1, 1])
+    axes[1, 1].set_title('Impact sur le Volume (Contrats signés attendus)')
+    
+    plt.show()
+
+else:
+    print("Pas de solution optimale trouvée. Vérifiez les contraintes.")
