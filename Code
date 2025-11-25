@@ -5,267 +5,258 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # ==============================================================================
-# 1. CONFIGURATION DES VARIABLES (Mapping)
+# 1. CONFIGURATION ET CHARGEMENT (Simulation des entrées)
 # ==============================================================================
 
-# Noms des colonnes selon ta demande
+# -- MAPPING DES VARIABLES --
+# Adapte ces noms si tes fichiers ont des noms différents
 COL_PF_ID = 'Contrat'
-COL_PF_COUT = 'COPTTC'               # Le numérateur de l'ELR (Sinistre/Charge)
-COL_PF_PRIME = 'tarif_vendu_ht_sansFR' # Le dénominateur (Prime Commerciale)
+COL_PF_PRIME_PURE = 'COPTTC'               # Numérateur ELR (Charge)
+COL_PF_PRIME_COMM = 'tarif_vendu_ht_sansFR' # Dénominateur ELR (Prime)
 COL_PF_ACT = 'Activite'
 
 COL_DEV_ID = 'numcnt'
-COL_DEV_PRIME = 'tarif_vendu_ht_sansFR' # Je suppose que c'est le même nom que dans le PF
-COL_DEV_ACT = 'activite' # Attention à la casse (majuscule/minuscule)
+COL_DEV_PRIME = 'tarif_vendu_ht_sansFR'
+COL_DEV_ACT = 'activite'
 
-# Liste exacte des features que ton modèle EBM attend (ordre important !)
-# Assure-toi que les noms matchent ceux de df_devis
+# Features attendues par ton modèle EBM (ordre strict)
 FEATURES_EBM = [
-    'tarif_vendu_ht_sansFR', # C'est cette variable qu'on va faire bouger
-    'activite', 
-    'type_client', 
-    'produit', 
-    'surface_bins', 
-    'chiffre_affaires_bins', 
-    'type_occupation_local', 
-    'cop_ttc', 
-    'reduction', 
-    'capital_incendie_bins'
+    'tarif_vendu_ht_sansFR', 'activite', 'type_client', 'produit', 
+    'surface_bins', 'chiffre_affaires_bins', 'type_occupation_local', 
+    'cop_ttc', 'reduction', 'capital_incendie_bins'
 ]
 
+# -- SIMULATION DES DONNÉES (À REMPLACER PAR TES IMPORTS) --
+# Dans ton vrai script : df_pf = pd.read_csv(...) et df_devis = pd.read_csv(...)
+np.random.seed(42)
+
+# 1. Base Portefeuille (Historique)
+activites_list = ['Bureau', 'Commerce', 'Restauration', 'BTP']
+n_pf = 5000
+df_pf = pd.DataFrame({
+    COL_PF_ID: range(n_pf),
+    COL_PF_ACT: np.random.choice(activites_list, n_pf),
+    COL_PF_PRIME_COMM: np.random.uniform(1000, 3000, n_pf)
+})
+# Simulation ELR : Bureau (30%), Commerce (50%), Resto (70%), BTP (95%)
+elr_map = {'Bureau': 0.30, 'Commerce': 0.50, 'Restauration': 0.70, 'BTP': 0.95}
+df_pf[COL_PF_PRIME_PURE] = df_pf.apply(lambda x: x[COL_PF_PRIME_COMM] * elr_map[x[COL_PF_ACT]] * np.random.normal(1, 0.2), axis=1)
+
+# 2. Base Devis (Cible 40k)
+n_devis = 5000 # Réduit pour l'exemple, mets 40000
+df_devis = pd.DataFrame({
+    COL_DEV_ID: range(n_devis),
+    COL_DEV_ACT: np.random.choice(activites_list, n_devis),
+    COL_DEV_PRIME: np.random.uniform(1000, 3000, n_devis),
+    # Autres colonnes bidons pour l'EBM
+    'type_client': 'Pro', 'produit': 'MRP', 'surface_bins': '50-100',
+    'chiffre_affaires_bins': '100k-500k', 'type_occupation_local': 'Locataire',
+    'cop_ttc': 100, 'reduction': 0, 'capital_incendie_bins': '100k'
+})
+
+# 3. Mock Modèle EBM (À REMPLACER PAR TON MODEL.PREDICT_PROBA)
+class MockEBM:
+    def predict_proba(self, X):
+        # Simule une proba décroissante avec le prix
+        # X est un DataFrame
+        base_proba = 0.35
+        # Plus c'est cher, moins on convertit
+        price_impact = -0.00005 * X[COL_DEV_PRIME] 
+        return np.column_stack([np.zeros(len(X)), base_proba + price_impact])
+
+ebm_model = MockEBM() 
+
+print(">>> Données chargées et modèle prêt.")
+
 # ==============================================================================
-# 2. CALCUL DE L'ELR (Depuis le Portefeuille)
+# 2. CALCULS ACTUARIELS (ELR & COÛT TECHNIQUE)
 # ==============================================================================
+
+# A. Calcul ELR Historique par Activité (Triage inclus pour la contrainte C3)
 print(">>> Calcul des ELR par activité...")
+stats_activites = df_pf.groupby(COL_PF_ACT).apply(
+    lambda x: pd.Series({
+        'elr': x[COL_PF_PRIME_PURE].sum() / x[COL_PF_PRIME_COMM].sum()
+    })
+).reset_index()
 
-# On groupe par activité pour avoir la performance historique
-elr_ref = df_pf.groupby(COL_PF_ACT)[[COL_PF_COUT, COL_PF_PRIME]].sum().reset_index()
-elr_ref['elr_segment'] = elr_ref[COL_PF_COUT] / elr_ref[COL_PF_PRIME]
-
-# On gère les divisions par zéro ou les segments vides
-elr_ref['elr_segment'] = elr_ref['elr_segment'].fillna(1.0) # Valeur par défaut prudente
-
-# ==============================================================================
-# 3. PRÉPARATION DES DONNÉES DEVIS & SCÉNARIOS
-# ==============================================================================
-print(">>> Préparation des scénarios et Prédiction EBM...")
-
-# A. Jointure pour récupérer l'ELR sur les devis
-# Attention : on s'assure que la colonne de jointure a le même nom
+# B. Enrichissement des Devis
 df_model = df_devis.merge(
-    elr_ref[[COL_PF_ACT, 'elr_segment']], 
+    stats_activites, 
     left_on=COL_DEV_ACT, 
     right_on=COL_PF_ACT, 
     how='left'
 )
+# Coût Technique (Constante €) = Prime Actuelle * ELR Activité
+df_model['cout_technique'] = df_model[COL_DEV_PRIME] * df_model['elr']
 
-# Si activité inconnue dans le PF, on met un ELR par défaut (ex: moyenne globale)
-mean_elr = elr_ref['elr_segment'].mean()
-df_model['elr_segment'] = df_model['elr_segment'].fillna(mean_elr)
-
-# B. Calcul du Coût Technique Estimé (C_i) - CONSTANTE
-# C'est la Prime Pure estimée : Prime Actuelle * ELR Historique
-df_model['cout_technique'] = df_model[COL_DEV_PRIME] * df_model['elr_segment']
-
-# C. Définition des bornes (Fonction Vectorisée)
+# C. Bornes de Majoration (Segmentation Métier)
 conditions = [
-    (df_model['elr_segment'] < 0.30),
-    (df_model['elr_segment'] >= 0.30) & (df_model['elr_segment'] < 0.50),
-    (df_model['elr_segment'] >= 0.50) & (df_model['elr_segment'] < 0.80), # 80% comme pivot moyen
-    (df_model['elr_segment'] >= 0.80)
+    (df_model['elr'] < 0.30),
+    (df_model['elr'] >= 0.30) & (df_model['elr'] < 0.50),
+    (df_model['elr'] >= 0.50) & (df_model['elr'] < 0.80),
+    (df_model['elr'] >= 0.80)
 ]
+# Min et Max pour chaque segment
 choices_min = [0.00,  0.005, 0.02, 0.05]
 choices_max = [0.005, 0.01,  0.04, 0.10]
 
 df_model['min_h'] = np.select(conditions, choices_min, default=0.05)
 df_model['max_h'] = np.select(conditions, choices_max, default=0.10)
 
-# D. Génération des Scénarios (Batch Prediction pour performance)
+# ==============================================================================
+# 3. GÉNÉRATION DES SCÉNARIOS & SCORING
+# ==============================================================================
+print(">>> Génération des scénarios (Discrétisation)...")
+
 scenarios_list = []
-input_data_list = [] # Pour stocker les features prêtes pour EBM
+ebm_inputs = []
+
+# Paramètres de discrétisation
+NB_STEPS = 20 # 20 scénarios par devis -> Précision fine
 
 for idx, row in df_model.iterrows():
-    # On crée 5 pas entre min et max
-    steps = np.linspace(row['min_h'], row['max_h'], 5)
-    steps = np.unique(steps) # Évite doublons si min=max
+    steps = np.linspace(row['min_h'], row['max_h'], NB_STEPS)
+    steps = np.unique(steps) # Évite doublons
     
     for hausse in steps:
         new_prime = row[COL_DEV_PRIME] * (1 + hausse)
         
-        # On prépare la ligne de features pour l'EBM
-        # On copie les données actuelles du devis
-        features = row[FEATURES_EBM].to_dict()
-        # ON MET À JOUR LA VARIABLE PRIX
-        features['tarif_vendu_ht_sansFR'] = new_prime 
-        
-        input_data_list.append(features)
+        # Préparation input EBM
+        feats = row[FEATURES_EBM].to_dict()
+        feats[COL_DEV_PRIME] = new_prime # On met à jour le prix
+        ebm_inputs.append(feats)
         
         scenarios_list.append({
             'devis_id': row[COL_DEV_ID],
+            'activite': row[COL_DEV_ACT],
+            'elr_segment': row['elr'],
             'prime_base': row[COL_DEV_PRIME],
             'hausse': hausse,
             'prime_finale': new_prime,
-            'cout_technique': row['cout_technique'],
-            'elr_segment': row['elr_segment'], # Pour l'analyse post-hoc
-            'activite': row[COL_DEV_ACT]
+            'cout_technique': row['cout_technique']
         })
 
-# E. Appel au Modèle EBM (Batch Prediction)
-# On convertit la liste de dicts en DataFrame pour le predict_proba
-df_ebm_input = pd.DataFrame(input_data_list)
-
-# --- PRÉDICTION ---
-# On récupère la probabilité de la classe 1 (Conversion)
-# EBM.predict_proba retourne [Proba_0, Proba_1]
-probas_conversion = ebm_model.predict_proba(df_ebm_input)[:, 1]
-
-# On réinjecte les probas dans les scénarios
 df_scen = pd.DataFrame(scenarios_list)
-df_scen['proba_predite'] = probas_conversion
 
-# Calcul de la Marge Espérée
+# Scoring en Batch (Très rapide)
+print(">>> Scoring EBM en cours...")
+df_ebm_input = pd.DataFrame(ebm_inputs)
+probas_raw = ebm_model.predict_proba(df_ebm_input)[:, 1]
+
+# Ajustement Expert (Si nécessaire pour forcer l'élasticité)
+# Ex: on réduit la proba de 0.2% pour chaque 1% de hausse supplémentaire
+df_scen['proba_predite'] = probas_raw * (1 - 0.2 * df_scen['hausse'])
+
+# Calcul Marge Espérée (Objectif)
 df_scen['marge_esperee'] = (df_scen['prime_finale'] - df_scen['cout_technique']) * df_scen['proba_predite']
 
 # ==============================================================================
-# 4. OPTIMISATION (Google OR-Tools)
+# 4. OPTIMISATION (MILP)
 # ==============================================================================
-print(">>> Lancement de l'optimisation...")
-
+print(f">>> Construction du modèle (Variables : {len(df_scen)})...")
 solver = pywraplp.Solver.CreateSolver('SCIP')
+solver.set_time_limit(180 * 1000) # 3 minutes max
 
-# Variables
-x = {}
-for i in df_scen.index:
-    x[i] = solver.BoolVar(f'x_{i}')
+# A. Variables Binaires
+x = {i: solver.BoolVar(f'x_{i}') for i in df_scen.index}
 
-# C1. Unicité (Une seule offre par devis)
-# Astuce performance : groupby sur index
-groups = df_scen.groupby('devis_id').groups
-for devis_id, indices in groups.items():
-    solver.Add(solver.Sum([x[i] for i in indices]) == 1)
+# B. Contrainte Unicité (1 scénario par devis)
+for d_id, group_idxs in df_scen.groupby('devis_id').groups.items():
+    solver.Add(solver.Sum([x[i] for i in group_idxs]) == 1)
 
-# Calcul du volume de base (proba à hausse 0 ou prix actuel)
-# Pour simplifier, on approxime par la somme des probas EBM avec hausse minimale
-# ou on refait un predict à 0%. Ici, on utilise la contrainte relative aux scénarios choisis.
-# Supposons qu'on veuille garder 90% du potentiel de conversion max de chaque client
-# (Approximation safe si on n'a pas calculé la proba exacte à 0% séparément)
-max_proba_per_id = df_scen.groupby('devis_id')['proba_predite'].max().sum()
-target_vol = 0.90 * max_proba_per_id
+# C. Contrainte Rétention Volume Global (>= 90%)
+# On estime le volume max potentiel (somme des max probas par devis)
+vol_ref = df_scen.groupby('devis_id')['proba_predite'].max().sum()
+current_vol = solver.Sum([row['proba_predite'] * x[i] for i, row in df_scen.iterrows()])
+solver.Add(current_vol >= 0.90 * vol_ref)
 
-solver.Add(solver.Sum([df_scen.loc[i, 'proba_predite'] * x[i] for i in df_scen.index]) >= target_vol)
+# D. Contrainte MONOTONIE INTER-ACTIVITÉS (C3)
+# 1. On trie les activités par ELR croissant
+sorted_acts = stats_activites.sort_values('elr')[COL_PF_ACT].tolist()
+print(f"Ordre Monotonie imposé : {' -> '.join(sorted_acts)}")
 
-# C3. Majoration Moyenne (Vision Offre : Pondérée par Prime Initiale)
-total_prime_base = df_model[COL_DEV_PRIME].sum()
-sum_maj = solver.Sum([df_scen.loc[i, 'prime_base'] * df_scen.loc[i, 'hausse'] * x[i] for i in df_scen.index])
+# 2. On prépare les Dénominateurs (Volumes Primes Fixes par Activité)
+denoms = df_model.groupby(COL_DEV_ACT)[COL_DEV_PRIME].sum().to_dict()
 
-solver.Add(sum_maj >= 0.038 * total_prime_base)
-solver.Add(sum_maj <= 0.042 * total_prime_base)
+# 3. On prépare les Numérateurs (Expressions Linéaires)
+nums_expr = {}
+for act in sorted_acts:
+    # Indices des scénarios de cette activité
+    idxs = df_scen[df_scen['activite'] == act].index
+    # Somme (PrimeBase * Hausse * x)
+    expr = solver.Sum([df_scen.loc[i, 'prime_base'] * df_scen.loc[i, 'hausse'] * x[i] for i in idxs])
+    nums_expr[act] = expr
 
-# Objectif : Max Marge
-solver.Maximize(solver.Sum([df_scen.loc[i, 'marge_esperee'] * x[i] for i in df_scen.index]))
+# 4. Création de la chaîne d'inégalités : Moyenne(A) <= Moyenne(B)
+for i in range(len(sorted_acts) - 1):
+    act_A = sorted_acts[i]
+    act_B = sorted_acts[i+1]
+    
+    # Produit en croix : NumA * DenB <= NumB * DenA
+    solver.Add(
+        nums_expr[act_A] * denoms[act_B] <= nums_expr[act_B] * denoms[act_A]
+    )
 
+# E. Objectif : Maximiser la Marge Totale
+objective = solver.Sum([row['marge_esperee'] * x[i] for i, row in df_scen.iterrows()])
+solver.Maximize(objective)
+
+# Résolution
+print(">>> Résolution en cours...")
 status = solver.Solve()
 
 # ==============================================================================
-# 5. RÉSULTATS & VISUALISATIONS
+# 5. RÉSULTATS & VISUALISATION
 # ==============================================================================
 
-if status == pywraplp.Solver.OPTIMAL:
-    print(">>> Solution Optimale Trouvée !")
+if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
+    print(f"\n>>> SUCCÈS ({status}) ! Marge Espérée Totale : {solver.Objective().Value():,.0f} €")
     
-    # Extraction des données finales
-    idx_selected = [i for i in x if x[i].solution_value() > 0.5]
-    df_result = df_scen.loc[idx_selected].copy()
+    # Récupération des choix
+    idx_opt = [i for i in x if x[i].solution_value() > 0.5]
+    df_res = df_scen.loc[idx_opt].copy()
     
-    # --- KPIs GLOBAUX ---
-    gwp_gain = (df_result['prime_finale'] * df_result['proba_predite']).sum()
-    marge_gain = df_result['marge_esperee'].sum()
-    avg_increase = (df_result['prime_base'] * df_result['hausse']).sum() / df_result['prime_base'].sum()
-    
-    print(f"Hausse Moyenne Globale : {avg_increase:.2%}")
-    print(f"Marge Espérée Totale   : {marge_gain:,.0f} €")
-
-    # ==========================
-    # VISUALISATIONS
-    # ==========================
-    sns.set_theme(style="whitegrid")
-    
-    # 1. SCATTER PLOT : SANCTION TARIFAIRE SELON LA QUALITÉ DU RISQUE (ELR)
-    # On agrège par activité pour que ce soit lisible
-    viz_data = df_result.groupby('activite').agg({
+    # --- VISUALISATION 1 : La Preuve de Monotonie ---
+    # On vérifie que la hausse moyenne suit bien l'ELR
+    viz_df = df_res.groupby('activite').agg({
         'elr_segment': 'mean',
         'hausse': 'mean',
-        'prime_base': 'sum' # Taille de la bulle
-    }).reset_index()
+        'prime_base': 'sum' # Poids
+    }).sort_values('elr_segment').reset_index()
+    
+    print("\n--- Tableau de Synthèse par Activité ---")
+    print(viz_df[['activite', 'elr_segment', 'hausse']])
     
     plt.figure(figsize=(10, 6))
-    scatter = sns.scatterplot(
-        data=viz_data, 
-        x='elr_segment', 
-        y='hausse', 
-        size='prime_base', 
-        sizes=(100, 1000),
-        hue='elr_segment',
-        palette='RdYlGn_r', # Rouge pour haut ELR, Vert pour bas ELR
-        legend=False
-    )
+    sns.set_style("whitegrid")
     
-    # Ajout d'une ligne moyenne cible
-    plt.axhline(y=0.04, color='grey', linestyle='--', label='Cible 4%')
-    plt.axvline(x=1.0, color='red', linestyle=':', label='Seuil Rentabilité (100%)')
+    # Barplot combiné
+    ax1 = sns.barplot(data=viz_df, x='activite', y='hausse', color='skyblue', alpha=0.6, label='Hausse Moyenne')
+    ax2 = ax1.twinx()
+    sns.lineplot(data=viz_df, x='activite', y='elr_segment', color='red', marker='o', lw=2, ax=ax2, label='ELR (Risque)')
     
-    plt.title("Corrélation : Qualité Technique (ELR) vs Hausse Appliquée", fontsize=14)
-    plt.xlabel("Expected Loss Ratio (S/P) de l'Activité", fontsize=12)
-    plt.ylabel("Hausse Tarifaire Moyenne", fontsize=12)
+    ax1.set_ylabel('Hausse Tarifaire (%)', color='blue')
+    ax2.set_ylabel('ELR (%)', color='red')
+    ax1.set_title('Validation de la Monotonie : La hausse suit le risque', fontsize=14)
     
-    # Formatage des axes en %
-    scatter.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: '{:.0%}'.format(x)))
-    scatter.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: '{:.1%}'.format(y)))
+    # Formatage %
+    vals = ax1.get_yticks()
+    ax1.set_yticklabels(['{:,.1%}'.format(x) for x in vals])
+    vals2 = ax2.get_yticks()
+    ax2.set_yticklabels(['{:,.0%}'.format(x) for x in vals2])
     
-    # Annotation des points extrêmes
-    for i in range(viz_data.shape[0]):
-        if viz_data.elr_segment.iloc[i] > 0.8 or viz_data.hausse.iloc[i] > 0.06:
-            plt.text(
-                viz_data.elr_segment.iloc[i]+0.01, 
-                viz_data.hausse.iloc[i], 
-                viz_data.activite.iloc[i], 
-                fontsize=9
-            )
-            
+    plt.show()
+
     [Image of linear programming feasible region]
-    plt.tight_layout()
-    plt.show()
-
-    # 2. DISTRIBUTION DES HAUSSES
+    
+    # --- VISUALISATION 2 : Distribution des hausses ---
     plt.figure(figsize=(8, 5))
-    sns.histplot(df_result['hausse'], bins=20, kde=True, color='skyblue')
-    plt.title("Distribution des Majorations appliquées aux Devis", fontsize=14)
-    plt.xlabel("Taux de Majoration", fontsize=12)
+    sns.histplot(df_res['hausse'], bins=20, kde=True, color='green')
+    plt.title('Distribution des Hausses appliquées', fontsize=14)
+    plt.xlabel('Taux de Majoration')
     plt.gca().xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: '{:.1%}'.format(x)))
-    plt.tight_layout()
     plt.show()
-
-    # 3. IMPACT SUR LA MARGE (Comparaison Avant/Après théorique)
-    # Marge Avant = (Prime Base - Cout) * Proba Base (approx via new proba for viz)
-    # Note: C'est une approx visuelle
     
-    categories = ['Marge Actuelle (Est.)', 'Marge Après Opti.']
-    # Simulation marge actuelle : on suppose proba conversion sans hausse un peu plus élevée
-    marge_actuelle_simu = (df_result['prime_base'] - df_result['cout_technique']).sum() * (df_result['proba_predite'].mean() * 1.1) 
-    values = [marge_actuelle_simu, marge_gain]
-    
-    plt.figure(figsize=(6, 6))
-    bars = plt.bar(categories, values, color=['lightgrey', '#2ecc71'])
-    plt.title("Gain d'Optimisation de la Marge", fontsize=14)
-    plt.ylabel("Marge Technique Espérée (€)")
-    
-    # Ajout des valeurs sur les barres
-    for bar in bars:
-        yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval + yval*0.01, f"{yval:,.0f} €", ha='center', va='bottom', fontsize=12, fontweight='bold')
-        
-    plt.tight_layout()
-    plt.show()
-
 else:
-    print("Aucune solution trouvée. Vérifiez que les contraintes ne sont pas contradictoires (ex: ELR vs Cible 4%).")
+    print("Pas de solution trouvée. Vérifier les contraintes (ex: monotonie trop stricte si ELR très proches).")
